@@ -3,10 +3,15 @@
 Gradient-free PyTorch optimizer using Evolution-Strategy style stochastic
 perturbations combined with LARS-style global trust-ratio adaptive step sizing.
 
-`chaostrainer.Chaos` is a drop-in `torch.optim.Optimizer` subclass: it plugs
-into the standard PyTorch training loops, works transparently on CPU / CUDA / MPS, 
-computes optimizations efficiently via parallel `map` vectors, and supports
-parameter groups, `state_dict()` checkpointing, and per-group hyperparameters.
+`chaostrainer.Chaos` is a `torch.optim.Optimizer` subclass that works
+transparently on CPU / CUDA / MPS, vectorizes perturbation evaluation via
+`torch.func.vmap`, and supports parameter groups, `state_dict()` checkpointing,
+and per-group hyperparameters.
+
+Unlike standard PyTorch optimizers, `Chaos.step` takes `(model, criterion,
+*args, **kwargs)` rather than an optional `closure`: the optimizer drives the
+forward pass itself through `torch.func.functional_call`, so `loss.backward()`
+is never needed.
 
 ## Why gradient-free?
 
@@ -65,23 +70,23 @@ for step in range(15_000):
         break
 ```
 
-The optimizer performs evaluations internally via vectorized mapping (`vmap`), which does **not** rely on PyTorch's legacy closure design or `loss.backward()`. Chaos directly maps your `model` and `criterion` across parallel dimension batches (once at `θ+δ`, once at `θ-δ`).
-
 ## Algorithm
 
-Each step, for `k = 1 … num_perturbations`:
+Each step:
 
-1. Sample `δ ~ N(0, ε² I)` independently for every parameter.
-2. Evaluate the loss at `θ + δ` and `θ − δ` (antithetic / central-difference).
-3. Form the variance-reduced Evolution-Strategy estimator
+1. Sample `δ_k ~ N(0, ε² I)` independently for every parameter, for
+   `k = 1 … num_perturbations`.
+2. Evaluate `L(θ + δ_k)` and `L(θ − δ_k)` in parallel via `vmap` over the
+   perturbation dimension — one vmapped forward pass for the plus batch and
+   one for the minus batch, regardless of `num_perturbations`.
+3. Form the antithetic Evolution-Strategy estimator and average across samples:
 
    ```
-   ĝ = (L(θ+δ) − L(θ−δ)) · δ / (2 ε²)
+   ĝ = mean_k [ (L(θ+δ_k) − L(θ−δ_k)) · δ_k / (2 ε²) ]
    ```
 
-4. Average over the `num_perturbations` samples.
-5. Update the momentum buffer `m ← β · m + ĝ`.
-6. Take a LARS-inspired step rescaled by the global weight-to-momentum norm
+4. Update the momentum buffer `m ← β · m + ĝ`.
+5. Take a LARS-inspired step rescaled by the global weight-to-momentum norm
    ratio
 
    ```
@@ -119,11 +124,20 @@ mixed-precision (AMP) training without tuning.
 
 ### Performance & VRAM Optimization (Pro Tips)
 
-ChaosTrainer is architected with industry-standard practices to handle intensive `num_perturbations` loops without blowing up VRAM or CPU dispatch queues:
-
-- **Zero-Allocation & Multi-Tensor Backend:** The optimizer re-uses pre-allocated perturbation buffers in-place and directly hooks into PyTorch's `_foreach` (C++ multi-tensor) operations. It scales at raw C/SIMD speeds (avoiding Python `for` loop bottlenecks) with absolutely **zero extra VRAM spikes**, whether you are on CUDA or CPU.
-- **`torch.compile()` is your best friend:** Since `closure()` runs multiple times per step, Python inference overhead builds up. Compiling your model (`model = torch.compile(model)`) before passing it to the closure fuses operations into a single optimized kernel, dramatically speeding up `num_perturbations` iteration times.
-- **Native Automatic Mixed Precision (AMP):** ChaosTrainer is fully compatible with `torch.autocast`. Since no autograd graph is needed, running your model forward passes in `fp16` or `bf16` halves your memory footprint instantly and unlocks pure TensorCore acceleration.
+- **Vectorized perturbations via `vmap`:** All `num_perturbations` samples are
+  evaluated in two fused forward passes rather than a Python loop, so Python
+  dispatch overhead is amortized across the entire batch of perturbations.
+  Peak VRAM scales with `num_perturbations × batch_size × activation_size` —
+  reduce `num_perturbations` if you OOM.
+- **Multi-tensor `_foreach` momentum/update:** Parameter-level bookkeeping
+  (momentum step, norm reduction, weight update) uses PyTorch's C++
+  multi-tensor kernels, avoiding per-parameter Python overhead.
+- **`torch.compile()` is your best friend:** Wrapping `model = torch.compile(model)`
+  fuses the vmapped forward into a single kernel, dramatically speeding up
+  large `num_perturbations` runs.
+- **Native Automatic Mixed Precision (AMP):** Since no autograd graph is kept,
+  running forward passes under `torch.autocast` in `fp16` / `bf16` halves the
+  memory footprint and unlocks TensorCore acceleration.
 
 ## Running the example
 

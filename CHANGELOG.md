@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-04-19
+
+### Changed
+- Migrated `Chaos.step` to a `torch.func.vmap` architecture: all
+  `num_perturbations` samples are evaluated in two fused forward passes
+  (antithetic plus/minus) instead of a Python loop.
+- Perturbations and updates are now driven exclusively from the optimizer's
+  `param_groups`, so partial-parameter optimizers and reordered param groups
+  behave correctly. Parameters on the model that are not registered with the
+  optimizer are no longer perturbed.
+- Trust-ratio step now applied without forcing a per-step GPU→CPU sync.
+- `num_perturbations` is stored in `defaults` and therefore round-trips
+  through `state_dict()`.
+
+### Fixed
+- Gradient accumulator could misalign with `param_groups` when group order
+  differed from `model.named_parameters()` order.
+
 ## [0.1.0] - 2026-04-18
 
 ### Added

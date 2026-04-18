@@ -20,8 +20,8 @@ def _deterministic():
 
 
 def test_rejects_missing_arguments():
-    p = nn.Parameter(torch.zeros(3))
-    opt = Chaos([p])
+    model = nn.Linear(3, 1)
+    opt = Chaos(model.parameters())
     with pytest.raises(TypeError):
         opt.step()  # type: ignore[call-arg]
 
@@ -42,12 +42,11 @@ def test_rejects_invalid_hyperparameters(kwargs):
 
 
 def test_parameter_groups_accept_overrides():
-    a = nn.Parameter(torch.zeros(3))
-    b = nn.Parameter(torch.zeros(3))
+    model = nn.Sequential(nn.Linear(3, 3), nn.Linear(3, 3))
     opt = Chaos(
         [
-            {"params": [a], "lr": 0.5, "beta": 0.5},
-            {"params": [b], "lr": 2.0},
+            {"params": list(model[0].parameters()), "lr": 0.5, "beta": 0.5},
+            {"params": list(model[1].parameters()), "lr": 2.0},
         ]
     )
     assert opt.param_groups[0]["lr"] == 0.5
@@ -103,9 +102,8 @@ def test_converges_on_quadratic():
 
     start = criterion(model.x).item()
     for _ in range(300):
-        # We pass a dummy tensor so `args[:1]` is provided, or we can just omit it because `forward` defaults `_` to `None`.
         opt.step(model, criterion)
-    
+
     end = criterion(model.x).item()
     assert end < start * 0.5
 
@@ -141,6 +139,84 @@ def test_multiple_perturbations_reduce_variance():
 
     assert run(1) < 0.25
     assert run(4) < 0.25
+
+
+# ---------------------------------------------------------------------------
+# param_groups alignment
+# ---------------------------------------------------------------------------
+
+
+def test_reversed_param_groups_still_converge():
+    """Group order differing from model.named_parameters() order must not
+    misalign gradients with their parameters."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 4), nn.Tanh(), nn.Linear(4, 2))
+    groups = [
+        {"params": list(model[2].parameters())},
+        {"params": list(model[0].parameters())},
+    ]
+    opt = Chaos(groups, lr=1e-2, num_perturbations=4)
+
+    X = torch.randn(16, 4)
+    Y = torch.randn(16, 2)
+    loss_fn = nn.MSELoss()
+
+    start = loss_fn(model(X), Y).item()
+    for _ in range(300):
+        opt.step(model, loss_fn, X, Y)
+    end = loss_fn(model(X), Y).item()
+    assert end < start * 0.9
+
+
+def test_partial_params_leaves_others_untouched():
+    """Parameters not registered with the optimizer must not change."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 4), nn.Tanh(), nn.Linear(4, 2))
+    opt = Chaos(model[0].parameters(), lr=1e-2, num_perturbations=4)
+
+    frozen_snapshot = [p.detach().clone() for p in model[2].parameters()]
+    X = torch.randn(16, 4)
+    Y = torch.randn(16, 2)
+    loss_fn = nn.MSELoss()
+
+    for _ in range(50):
+        opt.step(model, loss_fn, X, Y)
+
+    for before, after in zip(frozen_snapshot, model[2].parameters()):
+        assert torch.equal(before, after)
+
+
+def test_rejects_params_not_on_model():
+    model = nn.Linear(3, 3)
+    stray = nn.Parameter(torch.zeros(3))
+    opt = Chaos([*model.parameters(), stray])
+
+    def criterion(outputs, tgt):
+        return (outputs - tgt).pow(2).mean()
+
+    with pytest.raises(ValueError):
+        opt.step(model, criterion, torch.randn(2, 3), torch.zeros(2, 3))
+
+
+# ---------------------------------------------------------------------------
+# Numerical stability
+# ---------------------------------------------------------------------------
+
+
+def test_cold_start_does_not_nan_with_many_perturbations():
+    """On the first step the momentum norm is exactly zero; _NORM_FLOOR must
+    keep the trust ratio finite."""
+    torch.manual_seed(0)
+    model = nn.Linear(8, 4)
+    opt = Chaos(model.parameters(), lr=1e-2, num_perturbations=16)
+
+    def criterion(outputs):
+        return outputs.pow(2).mean()
+
+    loss = opt.step(model, criterion, torch.randn(4, 8))
+    assert torch.isfinite(loss)
+    for p in model.parameters():
+        assert torch.isfinite(p).all()
 
 
 # ---------------------------------------------------------------------------

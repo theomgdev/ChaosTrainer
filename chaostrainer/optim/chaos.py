@@ -6,7 +6,7 @@ perturbation combined with LARS-style global trust-ratio adaptive step sizing.
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Callable
 
 import torch
 from torch import Tensor, nn
@@ -71,7 +71,7 @@ class Chaos(Optimizer):
         >>> from torch import nn
         >>> from chaostrainer import Chaos
         >>> model = nn.Sequential(nn.Linear(2, 8), nn.Tanh(), nn.Linear(8, 1))
-        >>> optimizer = Chaos(model.parameters(), lr=1.0)
+        >>> optimizer = Chaos(model.parameters(), lr=1e-2)
         >>> X = torch.tensor([[0., 0.], [0., 1.], [1., 0.], [1., 1.]])
         >>> Y = torch.tensor([[0.], [1.], [1.], [0.]])
         >>> loss_fn = nn.MSELoss()
@@ -79,11 +79,12 @@ class Chaos(Optimizer):
         ...     loss = optimizer.step(model, loss_fn, X, Y)
 
     Note:
-        This optimizer **requires** a module and callable `criterion` that takes model output as input and computes the scalar loss. The
-        forward pass evaluation does *not* need to call ``loss.backward()``; Chaos ignores any
-        gradients. :meth:`step` returns :math:`L(\theta+\delta)` of the final
-        perturbation sample, consistent with the torch optimizer convention of
-        returning an objective value observed during the step.
+        This optimizer **requires** a module and a callable ``criterion`` that
+        takes the model output (and any additional args/kwargs passed to
+        :meth:`step`) and returns a scalar loss. ``loss.backward()`` is never
+        called; Chaos ignores autograd entirely. :meth:`step` returns the mean
+        of :math:`L(\theta+\delta_k)` across the ``num_perturbations`` samples
+        used in the step.
 
     References:
         Salimans et al. 2017, *Evolution Strategies as a Scalable Alternative
@@ -111,6 +112,7 @@ class Chaos(Optimizer):
         defaults = dict(
             lr=lr,
             beta=beta,
+            num_perturbations=int(num_perturbations),
         )
         super().__init__(params, defaults)
         self.num_perturbations = int(num_perturbations)
@@ -119,124 +121,108 @@ class Chaos(Optimizer):
     def step(self, model: nn.Module, criterion: Callable[..., Tensor], *args, **kwargs) -> Tensor:  # type: ignore[override]
         """Perform a single optimization step using vectorized map (vmap).
 
+        Only parameters registered in this optimizer's ``param_groups`` are
+        perturbed and updated; any other ``requires_grad=True`` parameters on
+        the model are held at their current values during the forward pass.
+
         Args:
             model: PyTorch module whose parameters are being optimized.
             criterion: A callable computing the scalar loss from model outputs.
             *args: Positional arguments passed to the model and criterion.
             **kwargs: Keyword arguments passed to the criterion.
-        """
-        # Collect trainable params and lazy-initialize momentum state.
-        params_dict = dict(model.named_parameters())
-        trainable_params_dict = {}
-        
-        for name, p in params_dict.items():
-            if p.requires_grad:
-                trainable_params_dict[name] = p
 
+        Returns:
+            Mean of ``L(θ+δ)`` across the perturbation samples used in the step.
+        """
+        # Build the inverse map from Parameter -> name so we can drive the
+        # forward pass exclusively from param_groups (not named_parameters).
+        param_to_name = {p: name for name, p in model.named_parameters()}
+
+        optim_params: list[Tensor] = []
+        optim_names: list[str] = []
+        group_slices: list[tuple[int, int]] = []
         for group in self.param_groups:
+            start = len(optim_params)
             for p in group["params"]:
                 if p is None or not p.requires_grad:
                     continue
+                name = param_to_name.get(p)
+                if name is None:
+                    raise ValueError(
+                        "Chaos optimizer received a parameter that is not "
+                        "registered on the supplied model. Ensure the optimizer "
+                        "was constructed from model.parameters()."
+                    )
+                optim_params.append(p)
+                optim_names.append(name)
                 state = self.state[p]
                 if "momentum" not in state:
                     state["momentum"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+            group_slices.append((start, len(optim_params)))
 
-        if not trainable_params_dict:
+        if not optim_params:
             return torch.zeros((), dtype=torch.float32)
 
-        params_names = list(trainable_params_dict.keys())
-        params = list(trainable_params_dict.values())
-
-        device = params[0].device
+        device = optim_params[0].device
         eps_std = _PERTURBATION_STD
         inv_2eps_sq = 1.0 / (2.0 * eps_std * eps_std)
 
-        # Prepare batched parameters with antithetic noise
-        batched_params_plus = {}
-        batched_params_minus = {}
-
-        for name, p in trainable_params_dict.items():
-            noise = torch.randn(self.num_perturbations, *p.shape, device=device, dtype=p.dtype) * eps_std
-            batched_params_plus[name] = p.unsqueeze(0) + noise
-            batched_params_minus[name] = p.unsqueeze(0) - noise
-
-        batched_params_plus_tuple = tuple(batched_params_plus.values())
-        batched_params_minus_tuple = tuple(batched_params_minus.values())       
-        keys = list(batched_params_plus.keys())
+        # Sample antithetic perturbations once; keep noise tensors directly
+        # instead of recovering them by subtraction downstream.
+        noises: list[Tensor] = [
+            torch.randn(self.num_perturbations, *p.shape, device=device, dtype=p.dtype) * eps_std
+            for p in optim_params
+        ]
+        batched_plus = tuple(p.unsqueeze(0) + n for p, n in zip(optim_params, noises))
+        batched_minus = tuple(p.unsqueeze(0) - n for p, n in zip(optim_params, noises))
 
         def compute_loss(params_tuple):
-            params_mapping = dict(zip(keys, params_tuple))
+            params_mapping = dict(zip(optim_names, params_tuple))
             out = functional_call(model, params_mapping, args[:1])
             return criterion(out, *args[1:], **kwargs)
 
         vmap_loss = vmap(compute_loss, in_dims=(0,))
+        loss_plus = vmap_loss(batched_plus)
+        loss_minus = vmap_loss(batched_minus)
 
-        loss_plus = vmap_loss(batched_params_plus_tuple)
-        loss_minus = vmap_loss(batched_params_minus_tuple)
-
-        # Compute gradient estimator
         coef = (loss_plus - loss_minus) * inv_2eps_sq
 
-        grad_acc = [torch.zeros_like(p) for p in params]
-
-        for i, (name, p) in enumerate(trainable_params_dict.items()):
-            noise_used = batched_params_plus[name] - p.unsqueeze(0)
+        grad_acc: list[Tensor] = []
+        for p, noise in zip(optim_params, noises):
             c_shape = [-1] + [1] * p.dim()
-            grad_contrib = (noise_used * coef.view(c_shape)).mean(dim=0)
-            grad_acc[i].copy_(grad_contrib)
+            grad_acc.append((noise * coef.view(c_shape)).mean(dim=0))
 
-        last_loss = loss_plus.mean()
+        mean_loss = loss_plus.mean()
 
-        # Momentum update (per-group β).
-        idx = 0
-        for group in self.param_groups:
-            beta = group["beta"]
-            group_params = [p for p in group["params"] if p is not None and p.requires_grad]
-            if not group_params:
+        # Momentum update per group; slices keep optim_params aligned with
+        # param_groups order by construction.
+        momentums = [self.state[p]["momentum"] for p in optim_params]
+        for group, (start, end) in zip(self.param_groups, group_slices):
+            if start == end:
                 continue
-            
-            group_mems = [self.state[p]["momentum"] for p in group_params]
-            group_grads = grad_acc[idx : idx + len(group_params)]
-            
-            # Multi-tensor momentum update
-            torch._foreach_mul_(group_mems, beta)
+            group_mems = momentums[start:end]
+            group_grads = grad_acc[start:end]
+            torch._foreach_mul_(group_mems, group["beta"])
             torch._foreach_add_(group_mems, group_grads)
-            idx += len(group_params)
 
-        # Global trust-ratio norms (in fp32 to avoid low-precision overflow).
-        momentums = [self.state[p]["momentum"] for p in params]
-        
-        # Use highly-optimized C++ multi-tensor operations for L2 norms
-        p_norms = torch._foreach_norm(params, 2.0)
+        # Global trust-ratio norms (fp32 accumulation for mixed-precision safety).
+        p_norms = torch._foreach_norm(optim_params, 2.0)
         m_norms = torch._foreach_norm(momentums, 2.0)
-
-        # Stack individual norms, cast to fp32, and compute the global squared norm
         weight_sq = torch.stack([n.to(torch.float32) for n in p_norms]).pow(2).sum()
         moment_sq = torch.stack([n.to(torch.float32) for n in m_norms]).pow(2).sum()
-
         weight_norm = torch.sqrt(weight_sq + _NORM_FLOOR)
         moment_norm = torch.sqrt(moment_sq + _NORM_FLOOR)
-        global_ratio = float((weight_norm / moment_norm).detach())
+        ratio = weight_norm / moment_norm
 
-        # Apply per-group update using group-local lr.
-        for group in self.param_groups:
-            lr = group["lr"]
-            step_scale = -lr * global_ratio
-            group_params = [p for p in group["params"] if p is not None and p.requires_grad]
-            if not group_params:
+        # Per-group step without forcing a GPU→CPU sync: multiply the momentum
+        # list by the (tensor) scale once and _foreach_add_ the result.
+        for group, (start, end) in zip(self.param_groups, group_slices):
+            if start == end:
                 continue
-                
-            group_mems = [self.state[p]["momentum"] for p in group_params]
-            
-            # Multi-tensor weight update
-            torch._foreach_add_(group_params, group_mems, alpha=step_scale)
+            group_params = optim_params[start:end]
+            group_mems = momentums[start:end]
+            scale = (-group["lr"] * ratio).to(group_mems[0].dtype)
+            scaled = torch._foreach_mul(group_mems, scale)
+            torch._foreach_add_(group_params, scaled)
 
-        return last_loss if last_loss is not None else torch.zeros((), device=device)
-
-def _as_scalar(value) -> Tensor:
-    """Coerce a closure return value into a 0-dim scalar tensor."""
-    if isinstance(value, Tensor):
-        if value.ndim != 0:
-            value = value.mean()
-        return value
-    return torch.as_tensor(float(value))
+        return mean_loss
