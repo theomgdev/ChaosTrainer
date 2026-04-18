@@ -65,6 +65,12 @@ class Chaos(Optimizer):
         num_perturbations: number of perturbation samples averaged per step.
             More samples reduce variance linearly at proportional cost.
             Default: ``1``.
+        perturbation_chunk_size: if set, evaluates perturbations in chunks of
+            this size instead of a single vmap over all ``num_perturbations``.
+            Caps peak VRAM (activations scale with the chunk size, not
+            ``num_perturbations``) while keeping vmap amortization. ``None``
+            means one chunk of size ``num_perturbations`` (no chunking).
+            Default: ``None``.
 
     Example:
         >>> import torch
@@ -101,6 +107,7 @@ class Chaos(Optimizer):
         beta: float = 0.9,
         *,
         num_perturbations: int = 1,
+        perturbation_chunk_size: int | None = None,
     ) -> None:
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -108,14 +115,28 @@ class Chaos(Optimizer):
             raise ValueError(f"Invalid beta: {beta} (must be in [0, 1))")
         if num_perturbations < 1:
             raise ValueError(f"Invalid num_perturbations: {num_perturbations}")
+        if perturbation_chunk_size is not None and perturbation_chunk_size < 1:
+            raise ValueError(
+                f"Invalid perturbation_chunk_size: {perturbation_chunk_size}"
+            )
 
         defaults = dict(
             lr=lr,
             beta=beta,
             num_perturbations=int(num_perturbations),
+            perturbation_chunk_size=(
+                int(perturbation_chunk_size)
+                if perturbation_chunk_size is not None
+                else None
+            ),
         )
         super().__init__(params, defaults)
         self.num_perturbations = int(num_perturbations)
+        self.perturbation_chunk_size = (
+            int(perturbation_chunk_size)
+            if perturbation_chunk_size is not None
+            else None
+        )
 
     @torch.no_grad()
     def step(self, model: nn.Module, criterion: Callable[..., Tensor], *args, **kwargs) -> Tensor:  # type: ignore[override]
@@ -167,14 +188,8 @@ class Chaos(Optimizer):
         eps_std = _PERTURBATION_STD
         inv_2eps_sq = 1.0 / (2.0 * eps_std * eps_std)
 
-        # Sample antithetic perturbations once; keep noise tensors directly
-        # instead of recovering them by subtraction downstream.
-        noises: list[Tensor] = [
-            torch.randn(self.num_perturbations, *p.shape, device=device, dtype=p.dtype) * eps_std
-            for p in optim_params
-        ]
-        batched_plus = tuple(p.unsqueeze(0) + n for p, n in zip(optim_params, noises))
-        batched_minus = tuple(p.unsqueeze(0) - n for p, n in zip(optim_params, noises))
+        K = self.num_perturbations
+        M = self.perturbation_chunk_size if self.perturbation_chunk_size is not None else K
 
         def compute_loss(params_tuple):
             params_mapping = dict(zip(optim_names, params_tuple))
@@ -182,17 +197,44 @@ class Chaos(Optimizer):
             return criterion(out, *args[1:], **kwargs)
 
         vmap_loss = vmap(compute_loss, in_dims=(0,))
-        loss_plus = vmap_loss(batched_plus)
-        loss_minus = vmap_loss(batched_minus)
 
-        coef = (loss_plus - loss_minus) * inv_2eps_sq
+        # Accumulate sum(noise_k · coef_k) across chunks, then divide by K at
+        # the end. Using matmul over the flattened perturbation axis avoids
+        # materializing the [k_c, *p.shape] broadcast product.
+        grad_acc: list[Tensor] = [torch.zeros_like(p) for p in optim_params]
+        loss_plus_sum = torch.zeros((), device=device, dtype=optim_params[0].dtype)
 
-        grad_acc: list[Tensor] = []
-        for p, noise in zip(optim_params, noises):
-            c_shape = [-1] + [1] * p.dim()
-            grad_acc.append((noise * coef.view(c_shape)).mean(dim=0))
+        offset = 0
+        while offset < K:
+            k_c = min(M, K - offset)
+            noises_c: list[Tensor] = [
+                torch.randn(k_c, *p.shape, device=device, dtype=p.dtype) * eps_std
+                for p in optim_params
+            ]
 
-        mean_loss = loss_plus.mean()
+            # Plus pass — free the batched tuple before allocating minus so the
+            # two forward-pass working sets do not overlap in VRAM.
+            plus = tuple(p.unsqueeze(0) + n for p, n in zip(optim_params, noises_c))
+            loss_plus = vmap_loss(plus)
+            del plus
+
+            minus = tuple(p.unsqueeze(0) - n for p, n in zip(optim_params, noises_c))
+            loss_minus = vmap_loss(minus)
+            del minus
+
+            coef = (loss_plus - loss_minus) * inv_2eps_sq  # [k_c]
+            loss_plus_sum = loss_plus_sum + loss_plus.sum()
+            del loss_minus
+
+            # grad_i += sum_k coef_k * noise_{k,i} via matmul on the flat axis.
+            for g, noise in zip(grad_acc, noises_c):
+                g.add_((coef @ noise.view(k_c, -1)).view(g.shape))
+
+            del noises_c, coef, loss_plus
+            offset += k_c
+
+        torch._foreach_div_(grad_acc, float(K))
+        mean_loss = loss_plus_sum / K
 
         # Momentum update per group; slices keep optim_params aligned with
         # param_groups order by construction.

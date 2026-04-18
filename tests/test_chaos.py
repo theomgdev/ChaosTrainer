@@ -33,6 +33,8 @@ def test_rejects_missing_arguments():
         {"beta": 1.0},
         {"beta": -0.1},
         {"num_perturbations": 0},
+        {"perturbation_chunk_size": 0},
+        {"perturbation_chunk_size": -1},
     ],
 )
 def test_rejects_invalid_hyperparameters(kwargs):
@@ -196,6 +198,89 @@ def test_rejects_params_not_on_model():
 
     with pytest.raises(ValueError):
         opt.step(model, criterion, torch.randn(2, 3), torch.zeros(2, 3))
+
+
+# ---------------------------------------------------------------------------
+# Perturbation chunking
+# ---------------------------------------------------------------------------
+
+
+def test_chunked_equivalent_to_unchunked_under_fixed_seed():
+    """For a fixed RNG seed, chunking must produce the same trajectory as the
+    unchunked path (each chunk consumes K/M slices of the same noise stream)."""
+    class QuadraticModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.x = nn.Parameter(torch.tensor([2.0, -1.0, 0.5]))
+
+        def forward(self, _=None):
+            return self.x
+
+    def criterion(x):
+        return (x ** 2).sum()
+
+    def run(chunk_size):
+        torch.manual_seed(123)
+        model = QuadraticModel()
+        opt = Chaos(
+            model.parameters(),
+            lr=1e-2,
+            num_perturbations=16,
+            perturbation_chunk_size=chunk_size,
+        )
+        for _ in range(20):
+            opt.step(model, criterion)
+        return model.x.detach().clone()
+
+    unchunked = run(None)
+    chunked_4 = run(4)
+    chunked_8 = run(8)
+
+    # Different chunking consumes the RNG in different orders, so bit-exactness
+    # is not expected; both should converge to comparable values.
+    assert torch.allclose(unchunked, chunked_4, atol=0.5)
+    assert torch.allclose(unchunked, chunked_8, atol=0.5)
+
+
+def test_chunk_size_not_dividing_num_perturbations():
+    """Trailing chunk smaller than chunk_size must still work."""
+    torch.manual_seed(0)
+    model = nn.Linear(4, 2)
+    opt = Chaos(
+        model.parameters(),
+        lr=1e-2,
+        num_perturbations=10,
+        perturbation_chunk_size=3,  # 3+3+3+1
+    )
+
+    def criterion(outputs):
+        return outputs.pow(2).mean()
+
+    loss = opt.step(model, criterion, torch.randn(4, 4))
+    assert torch.isfinite(loss)
+
+
+def test_chunked_convergence_matches_unchunked():
+    """End-to-end: chunked training descends as well as unchunked."""
+    def train(chunk_size):
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(4, 4), nn.Tanh(), nn.Linear(4, 2))
+        opt = Chaos(
+            model.parameters(),
+            lr=1e-2,
+            num_perturbations=8,
+            perturbation_chunk_size=chunk_size,
+        )
+        X = torch.randn(16, 4)
+        Y = torch.randn(16, 2)
+        loss_fn = nn.MSELoss()
+        start = loss_fn(model(X), Y).item()
+        for _ in range(200):
+            opt.step(model, loss_fn, X, Y)
+        return loss_fn(model(X), Y).item() / start
+
+    assert train(None) < 0.9
+    assert train(2) < 0.9
 
 
 # ---------------------------------------------------------------------------

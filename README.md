@@ -99,14 +99,16 @@ Each step:
 
 ## Hyperparameters
 
-| Name                | Default | Notes |
-|---------------------|---------|-------|
-| `lr`                | `1e-3`  | Effective per-step displacement as a fraction of `‖θ‖`. |
-| `beta`              | `0.9`   | Momentum decay on the gradient estimate. |
-| `num_perturbations` | `1`     | Samples averaged per step. |
+| Name                        | Default | Notes |
+|-----------------------------|---------|-------|
+| `lr`                        | `1e-3`  | Effective per-step displacement as a fraction of `‖θ‖`. |
+| `beta`                      | `0.9`   | Momentum decay on the gradient estimate. |
+| `num_perturbations`         | `1`     | Samples averaged per step. |
+| `perturbation_chunk_size`   | `None`  | Micro-batch size for the vmap forward (caps peak VRAM). `None` ⇒ one chunk of size `num_perturbations`. |
 
 `lr` and `beta` are per-parameter-group and can be overridden via the standard
-PyTorch `param_groups` mechanism. `num_perturbations` is an optimizer-level flag.
+PyTorch `param_groups` mechanism. `num_perturbations` and
+`perturbation_chunk_size` are optimizer-level flags.
 
 The perturbation std `ε = 1e-3` is a fixed internal constant. The variance of
 the central-difference ES estimator is independent of `ε`, and its bias
@@ -124,11 +126,16 @@ mixed-precision (AMP) training without tuning.
 
 ### Performance & VRAM Optimization (Pro Tips)
 
-- **Vectorized perturbations via `vmap`:** All `num_perturbations` samples are
-  evaluated in two fused forward passes rather than a Python loop, so Python
-  dispatch overhead is amortized across the entire batch of perturbations.
-  Peak VRAM scales with `num_perturbations × batch_size × activation_size` —
-  reduce `num_perturbations` if you OOM.
+- **Vectorized perturbations via `vmap`:** Each chunk of `num_perturbations`
+  samples is evaluated in two fused forward passes rather than a Python loop,
+  so Python dispatch overhead is amortized across the entire chunk. The plus
+  and minus forward passes are sequenced so their working sets do not overlap
+  in VRAM.
+- **Cap peak VRAM with `perturbation_chunk_size`:** Activation memory scales
+  with the chunk size, not `num_perturbations`. For large `K` (e.g. 1000),
+  setting `perturbation_chunk_size=64` keeps vmap amortization intact while
+  cutting peak activation VRAM by `K/chunk_size`. Use this when OOM risk
+  forces you to choose between batch size and sample count.
 - **Multi-tensor `_foreach` momentum/update:** Parameter-level bookkeeping
   (momentum step, norm reduction, weight update) uses PyTorch's C++
   multi-tensor kernels, avoiding per-parameter Python overhead.

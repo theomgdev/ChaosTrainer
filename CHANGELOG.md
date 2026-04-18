@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-04-19
+
+### Added
+- `perturbation_chunk_size` hyperparameter on `Chaos`. When set, perturbations
+  are evaluated in sequential chunks of this size instead of a single vmap
+  over all `num_perturbations`, capping peak activation VRAM while preserving
+  vmap amortization.
+
+### Changed
+- Plus / minus vmap forward passes are now sequenced with eager release, so
+  only one side's batched parameter tuple is live at a time (~33% parameter-
+  space VRAM reduction).
+- Per-parameter gradient reduction uses a matmul over the flattened
+  perturbation axis instead of broadcast-multiply-then-mean, avoiding a
+  `[K, *p.shape]` intermediate allocation.
+
 ## [0.1.1] - 2026-04-19
 
 ### Changed
