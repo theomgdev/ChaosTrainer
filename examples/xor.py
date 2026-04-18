@@ -39,11 +39,8 @@ def main() -> None:
     loss_fn = nn.MSELoss()
     optimizer = Chaos(model.parameters(), lr=args.lr)
 
-    def closure() -> torch.Tensor:
-        return loss_fn(model(X), Y)
-
     for epoch in range(1, args.epochs + 1):
-        loss = optimizer.step(closure).item()
+        loss = optimizer.step(model, loss_fn, X, Y).item()
 
         if loss < 1e-4:
             print(f"[{epoch:>5}] converged, loss={loss:.6f}")

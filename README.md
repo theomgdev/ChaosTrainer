@@ -4,8 +4,8 @@ Gradient-free PyTorch optimizer using Evolution-Strategy style stochastic
 perturbations combined with LARS-style global trust-ratio adaptive step sizing.
 
 `chaostrainer.Chaos` is a drop-in `torch.optim.Optimizer` subclass: it plugs
-into the standard PyTorch training loop via the same closure pattern used by
-`torch.optim.LBFGS`, works transparently on CPU / CUDA / MPS, and supports
+into the standard PyTorch training loops, works transparently on CPU / CUDA / MPS, 
+computes optimizations efficiently via parallel `map` vectors, and supports
 parameter groups, `state_dict()` checkpointing, and per-group hyperparameters.
 
 ## Why gradient-free?
@@ -59,18 +59,13 @@ Y = torch.tensor([[0.], [1.], [1.], [0.]])
 loss_fn = nn.MSELoss()
 optimizer = Chaos(model.parameters(), lr=1e-2)
 
-def closure():
-    return loss_fn(model(X), Y)
-
 for step in range(15_000):
-    loss = optimizer.step(closure).item()
+    loss = optimizer.step(model, loss_fn, X, Y).item()
     if loss < 1e-4:
         break
 ```
 
-The closure must return the scalar loss; it does **not** need to call
-`loss.backward()`. Chaos evaluates the closure twice per perturbation sample
-(once at `θ+δ`, once at `θ-δ`).
+The optimizer performs evaluations internally via vectorized mapping (`vmap`), which does **not** rely on PyTorch's legacy closure design or `loss.backward()`. Chaos directly maps your `model` and `criterion` across parallel dimension batches (once at `θ+δ`, once at `θ-δ`).
 
 ## Algorithm
 

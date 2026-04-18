@@ -19,10 +19,10 @@ def _deterministic():
 # ---------------------------------------------------------------------------
 
 
-def test_rejects_missing_closure():
+def test_rejects_missing_arguments():
     p = nn.Parameter(torch.zeros(3))
     opt = Chaos([p])
-    with pytest.raises(RuntimeError, match="closure"):
+    with pytest.raises(TypeError):
         opt.step()  # type: ignore[call-arg]
 
 
@@ -62,32 +62,51 @@ def test_parameter_groups_accept_overrides():
 
 
 def test_frozen_params_are_not_updated():
-    trainable = nn.Parameter(torch.ones(4))
-    frozen = nn.Parameter(torch.ones(4), requires_grad=False)
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.trainable = nn.Parameter(torch.ones(4))
+            self.frozen = nn.Parameter(torch.ones(4), requires_grad=False)
+
+        def forward(self, x=None):
+            return self.trainable, self.frozen
+
+    model = DummyModel()
     target = torch.zeros(4)
-    opt = Chaos([trainable, frozen], lr=1.0)
+    opt = Chaos(model.parameters(), lr=1.0)
 
-    def closure():
-        return ((trainable - target) ** 2).mean() + ((frozen - target) ** 2).mean()
+    def criterion(outputs, tgt):
+        train_out, frozen_out = outputs
+        return ((train_out - tgt) ** 2).mean() + ((frozen_out - tgt) ** 2).mean()
 
-    frozen_before = frozen.detach().clone()
+    frozen_before = model.frozen.detach().clone()
     for _ in range(20):
-        opt.step(closure)
+        opt.step(model, criterion, None, target)
 
-    assert torch.equal(frozen, frozen_before)
+    assert torch.equal(model.frozen, frozen_before)
 
 
 def test_converges_on_quadratic():
-    x = nn.Parameter(torch.tensor([3.0, -2.0, 1.5]))
-    opt = Chaos([x], lr=1e-2, num_perturbations=4)
+    class QuadraticModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.x = nn.Parameter(torch.tensor([3.0, -2.0, 1.5]))
 
-    def closure():
+        def forward(self, _=None):
+            return self.x
+
+    model = QuadraticModel()
+    opt = Chaos(model.parameters(), lr=1e-2, num_perturbations=4)
+
+    def criterion(x):
         return (x ** 2).sum()
 
-    start = closure().item()
+    start = criterion(model.x).item()
     for _ in range(300):
-        opt.step(closure)
-    end = closure().item()
+        # We pass a dummy tensor so `args[:1]` is provided, or we can just omit it because `forward` defaults `_` to `None`.
+        opt.step(model, criterion)
+    
+    end = criterion(model.x).item()
     assert end < start * 0.5
 
 
@@ -95,17 +114,29 @@ def test_multiple_perturbations_reduce_variance():
     # Both sample counts should descend the quadratic; we only assert that
     # convergence occurs, not a specific ordering (single-sample estimates
     # are noisy enough that a run-to-run swap is possible).
+    class QuadraticModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.x = nn.Parameter(torch.tensor([2.0, 2.0]))
+
+        def forward(self, _=None):
+            return self.x
+
     def run(num_perturbations: int) -> float:
         torch.manual_seed(42)
-        x = nn.Parameter(torch.tensor([2.0, 2.0]))
+        model = QuadraticModel()
         opt = Chaos(
-            [x], lr=0.1,
+            model.parameters(), lr=0.1,
             num_perturbations=num_perturbations,
         )
-        start = (x ** 2).sum().item()
+
+        def criterion(x):
+            return (x ** 2).sum()
+
+        start = criterion(model.x).item()
         for _ in range(500):
-            opt.step(lambda: (x ** 2).sum())
-        end = (x ** 2).sum().item()
+            opt.step(model, criterion)
+        end = criterion(model.x).item()
         return end / start
 
     assert run(1) < 0.25
@@ -131,12 +162,9 @@ def test_xor_converges():
 
     opt = Chaos(model.parameters(), lr=1e-2)
 
-    def closure():
-        return loss_fn(model(X), Y)
-
     final_loss = None
     for _ in range(15000):
-        final_loss = opt.step(closure).item()
+        final_loss = opt.step(model, loss_fn, X, Y).item()
         if final_loss < 1e-3:
             break
 
@@ -157,11 +185,12 @@ def test_state_dict_roundtrip():
     model = nn.Linear(3, 2)
     opt = Chaos(model.parameters(), lr=0.5, beta=0.8)
 
-    def closure():
-        return model(torch.randn(5, 3)).pow(2).mean()
+    def criterion(outputs):
+        return outputs.pow(2).mean()
 
     for _ in range(3):
-        opt.step(closure)
+        inputs = torch.randn(5, 3)
+        opt.step(model, criterion, inputs)
 
     state = opt.state_dict()
 
@@ -187,10 +216,11 @@ def test_runs_on_cuda():
     model = nn.Linear(4, 4).to(device)
     opt = Chaos(model.parameters(), lr=0.1)
 
-    def closure():
-        return model(torch.randn(8, 4, device=device)).pow(2).mean()
+    def criterion(outputs):
+        return outputs.pow(2).mean()
 
-    loss = opt.step(closure)
+    inputs = torch.randn(8, 4, device=device)
+    loss = opt.step(model, criterion, inputs)
     assert loss.device.type == "cuda"
     for p in model.parameters():
         assert p.device.type == "cuda"

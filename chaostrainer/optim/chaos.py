@@ -9,7 +9,8 @@ from __future__ import annotations
 from typing import Callable, Optional
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
+from torch.func import functional_call, vmap
 from torch.optim.optimizer import Optimizer
 
 __all__ = ["Chaos"]
@@ -50,7 +51,7 @@ class Chaos(Optimizer):
     Because no autograd graph is required, this optimizer is useful when:
     gradients are unavailable (non-differentiable losses, black-box simulators,
     discrete ops), gradients are prohibitively expensive, or you want an
-    autograd-free sanity baseline. It wraps each closure call in
+    autograd-free sanity baseline. It runs model passes within
     :func:`torch.no_grad`, saving activations memory relative to first-order
     methods.
 
@@ -74,14 +75,12 @@ class Chaos(Optimizer):
         >>> X = torch.tensor([[0., 0.], [0., 1.], [1., 0.], [1., 1.]])
         >>> Y = torch.tensor([[0.], [1.], [1.], [0.]])
         >>> loss_fn = nn.MSELoss()
-        >>> def closure():
-        ...     return loss_fn(torch.sigmoid(model(X)), Y)
         >>> for _ in range(2000):
-        ...     loss = optimizer.step(closure)
+        ...     loss = optimizer.step(model, loss_fn, X, Y)
 
     Note:
-        This optimizer **requires** a closure that returns the scalar loss. The
-        closure does *not* need to call ``loss.backward()``; Chaos ignores any
+        This optimizer **requires** a module and callable `criterion` that takes model output as input and computes the scalar loss. The
+        forward pass evaluation does *not* need to call ``loss.backward()``; Chaos ignores any
         gradients. :meth:`step` returns :math:`L(\theta+\delta)` of the final
         perturbation sample, consistent with the torch optimizer convention of
         returning an objective value observed during the step.
@@ -117,20 +116,23 @@ class Chaos(Optimizer):
         self.num_perturbations = int(num_perturbations)
 
     @torch.no_grad()
-    def step(self, closure: Optional[Callable[[], Tensor]] = None) -> Tensor:  # type: ignore[override]
-        """Perform a single optimization step.
+    def step(self, model: nn.Module, criterion: Callable[..., Tensor], *args, **kwargs) -> Tensor:  # type: ignore[override]
+        """Perform a single optimization step using vectorized map (vmap).
 
         Args:
-            closure: zero-argument callable that re-evaluates the model and
-                returns the scalar loss tensor. Required.
+            model: PyTorch module whose parameters are being optimized.
+            criterion: A callable computing the scalar loss from model outputs.
+            *args: Positional arguments passed to the model and criterion.
+            **kwargs: Keyword arguments passed to the criterion.
         """
-        if closure is None:
-            raise RuntimeError(
-                "Chaos requires a closure that recomputes and returns the loss."
-            )
-
         # Collect trainable params and lazy-initialize momentum state.
-        params: list[Tensor] = []
+        params_dict = dict(model.named_parameters())
+        trainable_params_dict = {}
+        
+        for name, p in params_dict.items():
+            if p.requires_grad:
+                trainable_params_dict[name] = p
+
         for group in self.param_groups:
             for p in group["params"]:
                 if p is None or not p.requires_grad:
@@ -138,50 +140,52 @@ class Chaos(Optimizer):
                 state = self.state[p]
                 if "momentum" not in state:
                     state["momentum"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                params.append(p)
 
-        if not params:
+        if not trainable_params_dict:
             return torch.zeros((), dtype=torch.float32)
+
+        params_names = list(trainable_params_dict.keys())
+        params = list(trainable_params_dict.values())
 
         device = params[0].device
         eps_std = _PERTURBATION_STD
         inv_2eps_sq = 1.0 / (2.0 * eps_std * eps_std)
 
-        # Gradient-estimate accumulator (same shape/dtype/device as each param).
-        grad_acc: list[Tensor] = [torch.zeros_like(p) for p in params]
-        
-        # Pre-allocate perturbation buffers to prevent VRAM fragmentation
-        # and allocation overhead during the num_perturbations loop.
-        deltas: list[Tensor] = [torch.empty_like(p) for p in params]
+        # Prepare batched parameters with antithetic noise
+        batched_params_plus = {}
+        batched_params_minus = {}
 
-        last_loss: Optional[Tensor] = None
+        for name, p in trainable_params_dict.items():
+            noise = torch.randn(self.num_perturbations, *p.shape, device=device, dtype=p.dtype) * eps_std
+            batched_params_plus[name] = p.unsqueeze(0) + noise
+            batched_params_minus[name] = p.unsqueeze(0) - noise
 
-        for _ in range(self.num_perturbations):
-            # Sample δ ~ N(0, ε² I) in-place.
-            for d in deltas:
-                d.normal_(mean=0.0, std=eps_std)
+        batched_params_plus_tuple = tuple(batched_params_plus.values())
+        batched_params_minus_tuple = tuple(batched_params_minus.values())       
+        keys = list(batched_params_plus.keys())
 
-            # Evaluate L(θ + δ).
-            torch._foreach_add_(params, deltas)
-            loss_plus = _as_scalar(closure()).detach()
+        def compute_loss(params_tuple):
+            params_mapping = dict(zip(keys, params_tuple))
+            out = functional_call(model, params_mapping, args[:1])
+            return criterion(out, *args[1:], **kwargs)
 
-            # Move θ + δ → θ − δ (subtract 2δ), then evaluate L(θ − δ).
-            torch._foreach_add_(params, deltas, alpha=-2.0)
-            loss_minus = _as_scalar(closure()).detach()
+        vmap_loss = vmap(compute_loss, in_dims=(0,))
 
-            # Restore θ.
-            torch._foreach_add_(params, deltas)
+        loss_plus = vmap_loss(batched_params_plus_tuple)
+        loss_minus = vmap_loss(batched_params_minus_tuple)
 
-            # Central-difference ES estimator: ĝ = (L+ − L−) · δ / (2ε²)
-            coef = float((loss_plus - loss_minus) * inv_2eps_sq)
-            torch._foreach_add_(grad_acc, deltas, alpha=coef)
+        # Compute gradient estimator
+        coef = (loss_plus - loss_minus) * inv_2eps_sq
 
-            last_loss = loss_plus
+        grad_acc = [torch.zeros_like(p) for p in params]
 
-        if self.num_perturbations > 1:
-            inv_n = 1.0 / float(self.num_perturbations)
-            for acc in grad_acc:
-                acc.mul_(inv_n)
+        for i, (name, p) in enumerate(trainable_params_dict.items()):
+            noise_used = batched_params_plus[name] - p.unsqueeze(0)
+            c_shape = [-1] + [1] * p.dim()
+            grad_contrib = (noise_used * coef.view(c_shape)).mean(dim=0)
+            grad_acc[i].copy_(grad_contrib)
+
+        last_loss = loss_plus.mean()
 
         # Momentum update (per-group β).
         idx = 0

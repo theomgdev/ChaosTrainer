@@ -72,11 +72,8 @@ def main() -> None:
         for batch_idx, (data, target) in enumerate(train_loader):
             data, target = data.to(device), target.to(device)
 
-            def closure() -> torch.Tensor:
-                return loss_fn(model(data), target)
-
             start_t = time.time()
-            loss = optimizer.step(closure).item()
+            loss = optimizer.step(model, loss_fn, data, target).item()
             step_t = time.time() - start_t
 
             if batch_idx % 20 == 0:
