@@ -9,6 +9,8 @@ dataset.
 Usage:
     python examples/mnist.py
     python examples/mnist.py --device cuda
+    python examples/mnist.py --device cuda --compile
+    python examples/mnist.py --compile --perturbation-chunk-size 128
 """
 
 from __future__ import annotations
@@ -37,6 +39,18 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--num-perturbations", type=int, default=1000)
+    parser.add_argument(
+        "--perturbation-chunk-size",
+        type=int,
+        default=None,
+        help="Cap peak VRAM by evaluating perturbations in chunks of this size.",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Wrap the model with torch.compile to fuse the vmapped forward pass.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -49,6 +63,9 @@ def main() -> None:
         nn.Flatten(),
         nn.Linear(28 * 28, 10)
     ).to(device)
+
+    if args.compile:
+        model = torch.compile(model)
 
     transform = transforms.Compose([
         transforms.ToTensor(),
@@ -63,17 +80,34 @@ def main() -> None:
     test_loader = DataLoader(test_dataset, batch_size=1000, shuffle=False)
 
     loss_fn = nn.CrossEntropyLoss()
-    optimizer = Chaos(model.parameters(), lr=args.lr, num_perturbations=1000)
+    optimizer = Chaos(
+        model.parameters(),
+        lr=args.lr,
+        num_perturbations=args.num_perturbations,
+        perturbation_chunk_size=args.perturbation_chunk_size,
+    )
 
-    print(f"Training on device: {device} | Total parameters: {sum(p.numel() for p in model.parameters())}")
+    total_params = sum(p.numel() for p in model.parameters())
+    print(
+        f"Device: {device} | Params: {total_params} | "
+        f"num_perturbations={args.num_perturbations} | "
+        f"chunk_size={args.perturbation_chunk_size} | "
+        f"compile={args.compile}"
+    )
 
     for epoch in range(1, args.epochs + 1):
         model.train()
         for batch_idx, (data, target) in enumerate(train_loader):
             data, target = data.to(device), target.to(device)
 
+            # Synchronize so Time/Step reflects actual GPU compute, not just
+            # dispatch latency. First compiled step includes graph capture.
+            if device.type == "cuda":
+                torch.cuda.synchronize()
             start_t = time.time()
             loss = optimizer.step(model, loss_fn, data, target).item()
+            if device.type == "cuda":
+                torch.cuda.synchronize()
             step_t = time.time() - start_t
 
             if batch_idx % 20 == 0:
