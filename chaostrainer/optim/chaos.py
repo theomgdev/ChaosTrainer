@@ -34,9 +34,9 @@ def _centered_rank_coef(
     estimator.
     """
     K = loss_plus.shape[0]
-    all_losses = torch.cat([loss_plus, loss_minus])          # [2K]
-    raw_ranks = torch.argsort(torch.argsort(all_losses)).float()  # 0 = smallest
-    centered = raw_ranks / (2 * K - 1) - 0.5                # [−0.5, 0.5]
+    all_losses = torch.cat([loss_plus, loss_minus])                    # [2K]
+    raw_ranks = torch.argsort(torch.argsort(all_losses)).float()       # 0 = smallest
+    centered = raw_ranks / (2 * K - 1) - 0.5                          # [−0.5, 0.5]
     return (centered[:K] - centered[K:]) * inv_2eps_sq
 
 
@@ -64,8 +64,14 @@ class Chaos(Optimizer):
     gradients are unavailable (non-differentiable losses, black-box simulators,
     discrete ops), gradients are prohibitively expensive, or you want an
     autograd-free sanity baseline. It runs model passes within
-    :func:`torch.no_grad`, saving activations memory relative to first-order
+    :func:`torch.no_grad`, saving activation memory relative to first-order
     methods.
+
+    **Dual-mode usage.** In addition to the standalone :meth:`step` (which runs
+    ES and applies the LARS update internally), :meth:`estimate_grad` exposes
+    the ES gradient estimate as a standard ``param.grad`` tensor, enabling
+    pairing with any PyTorch optimizer for the update step — see
+    :meth:`estimate_grad` for details and examples.
 
     Args:
         params: iterable of parameters or dicts defining parameter groups.
@@ -79,47 +85,45 @@ class Chaos(Optimizer):
             spirit of AdamW. Applied per-group. Default: ``0.0``.
         num_perturbations: number of perturbation samples averaged per step.
             More samples reduce estimator variance linearly at proportional
-            forward-pass cost. 8 is the default; lower to 1–2 only when compute
-            is extremely tight, raise to 16–64 for high-variance objectives.
-            Default: ``8``.
+            forward-pass cost. Lower to 1–2 only when compute is extremely
+            tight; raise to 16–64 for high-variance objectives. Default: ``8``.
         perturbation_chunk_size: if set, evaluates perturbations in chunks of
             this size instead of a single vmap over all ``num_perturbations``.
             Caps peak activation VRAM (activations scale with the chunk size,
             not ``num_perturbations``) while keeping vmap amortization. ``None``
             means one chunk of size ``num_perturbations`` (no chunking).
-            Note: all ``num_perturbations`` noise tensors are held in memory
-            simultaneously regardless of this setting (due to the two-phase
-            path used by default). Default: ``None``.
+            Note: when ``fitness_shaping`` or ``orthogonal_perturbations`` is
+            enabled, all ``num_perturbations`` noise tensors are held in memory
+            simultaneously regardless of this setting. Default: ``None``.
         perturbation_std: standard deviation ``ε`` of the Gaussian perturbation
             ``δ ~ N(0, ε² I)``. The central-difference estimator's variance is
             independent of this value and its bias vanishes as ``O(ε²)``, so
-            ``1e-3`` works well for fp32 and AMP training. Decrease toward
-            ``1e-4`` for fp16 to stay above the FP noise floor; increase toward
-            ``1e-2`` for very noisy loss surfaces. Must be positive.
-            Default: ``1e-3``.
+            ``1e-3`` works well for fp32 training. Decrease toward ``1e-4`` for
+            fp16 to stay above the FP noise floor; increase toward ``1e-2`` for
+            very noisy or flat loss surfaces. Must be positive. Default: ``1e-3``.
         grad_clip: if set, clips the global L2 norm of the ES gradient estimate
             to this value before the momentum update, preventing runaway steps
             on noisy or sparse objectives. Applied without a GPU→CPU sync.
             Must be positive. Default: ``None``.
         fitness_shaping: if ``True``, replaces raw loss differences with
             centered rank scores computed over all ``2 · num_perturbations``
-            evaluations before forming the gradient estimate. This makes the
-            optimizer invariant to monotonic transformations of the loss (e.g.
-            shifted or scaled rewards) — valuable for RL-style or non-stationary
-            objectives and as a general robustness measure. Set to ``False``
-            only when reproducing results that used raw loss differences, or
-            when ``num_perturbations`` is very small and the fixed-magnitude
-            coefficient at K=1 is undesirable. Default: ``True``.
+            evaluations before forming the gradient estimate. Makes the optimizer
+            invariant to monotonic transformations of the loss (e.g. shifted or
+            scaled rewards) — valuable for RL-style or non-stationary objectives.
+            Set to ``False`` only when reproducing results that used raw loss
+            differences, or when ``num_perturbations`` is very small and the
+            fixed-magnitude coefficient at K=1 is undesirable. Default: ``True``.
         orthogonal_perturbations: if ``True``, generates perturbation directions
             via QR orthogonalization (per parameter, in float32 for numerical
-            stability), so the ``num_perturbations`` noise vectors span
-            orthogonal subspaces. Reduces estimator variance compared to i.i.d.
-            Gaussian at the same sample count. Falls back to i.i.d. when
+            stability), so the ``num_perturbations`` noise vectors span orthogonal
+            subspaces. Reduces estimator variance compared to i.i.d. Gaussian at
+            the same sample count. Falls back to i.i.d. when
             ``num_perturbations > param.numel()``. Set to ``False`` only when
             reproducing i.i.d.-Gaussian baselines or when the QR cost matters
             at very large ``num_perturbations``. Default: ``True``.
 
-    Example:
+    Example — standalone ES training::
+
         >>> import torch
         >>> from torch import nn
         >>> from chaostrainer import Chaos
@@ -128,16 +132,14 @@ class Chaos(Optimizer):
         >>> X = torch.tensor([[0., 0.], [0., 1.], [1., 0.], [1., 1.]])
         >>> Y = torch.tensor([[0.], [1.], [1.], [0.]])
         >>> loss_fn = nn.MSELoss()
-        >>> for _ in range(2000):
+        >>> for _ in range(3000):
         ...     loss = optimizer.step(model, loss_fn, X, Y)
 
     Note:
-        This optimizer **requires** a module and a callable ``criterion`` that
-        takes the model output (and any additional args/kwargs passed to
-        :meth:`step`) and returns a scalar loss. ``loss.backward()`` is never
-        called; Chaos ignores autograd entirely. :meth:`step` returns the mean
-        of :math:`L(\theta+\delta_k)` across the ``num_perturbations`` samples
-        used in the step.
+        :meth:`step` **requires** a module and a callable ``criterion`` that
+        returns a scalar loss. ``loss.backward()`` is never called; Chaos ignores
+        autograd entirely. :meth:`step` returns the mean of
+        :math:`L(\theta+\delta_k)` across the ``num_perturbations`` samples used.
 
         Only ``lr``, ``beta``, and ``weight_decay`` can be overridden per
         param-group; all other hyperparameters are optimizer-wide and shared
@@ -220,12 +222,10 @@ class Chaos(Optimizer):
 
         When ``orthogonal_perturbations`` is enabled, each parameter's K noise
         vectors are orthogonalized via QR in float32 for numerical stability,
-        then cast back to the parameter dtype. This ensures the directions span
-        orthogonal subspaces, reducing estimator variance at the same K.
-        Falls back to i.i.d. Gaussian when ``K > param.numel()``.
+        then cast back to the parameter dtype. Falls back to i.i.d. Gaussian
+        when ``K > param.numel()``.
 
-        Returns a list of tensors, one per parameter, each of shape
-        ``[K, *param.shape]``.
+        Returns a list of tensors shaped ``[K, *param.shape]``.
         """
         if self.orthogonal_perturbations and K > 1:
             noises = []
@@ -245,21 +245,28 @@ class Chaos(Optimizer):
         ]
 
     @torch.no_grad()
-    def step(self, model: nn.Module, criterion: Callable[..., Tensor], *args, **kwargs) -> Tensor:  # type: ignore[override]
-        """Perform a single optimization step using vectorized map (vmap).
+    def _run_es(
+        self,
+        model: nn.Module,
+        criterion: Callable[..., Tensor],
+        *args,
+        **kwargs,
+    ) -> tuple[list[Tensor], list[Tensor], list[tuple[int, int]], Tensor]:
+        """Run ES forward passes and return the raw gradient accumulator.
 
-        Only parameters registered in this optimizer's ``param_groups`` are
-        perturbed and updated; any other ``requires_grad=True`` parameters on
-        the model are held at their current values during the forward pass.
-
-        Args:
-            model: PyTorch module whose parameters are being optimized.
-            criterion: A callable computing the scalar loss from model outputs.
-            *args: Positional arguments passed to the model and criterion.
-            **kwargs: Keyword arguments passed to the criterion.
+        Collects all ``num_perturbations`` antithetic evaluations, applies
+        fitness shaping and orthogonal noise as configured, and returns the
+        per-parameter gradient estimates (already divided by K) together with
+        the structural information needed by callers.
 
         Returns:
-            Mean of ``L(θ+δ)`` across the perturbation samples used in the step.
+            ``(optim_params, grad_acc, group_slices, mean_loss)``
+
+            - *optim_params*: flat list of optimized parameter tensors.
+            - *grad_acc*: ES gradient estimate for each parameter, same order.
+            - *group_slices*: ``(start, end)`` index pairs mapping each
+              ``param_group`` into *optim_params*.
+            - *mean_loss*: mean of ``L(θ+δ_k)`` across the K samples.
         """
         param_to_name = {p: name for name, p in model.named_parameters()}
 
@@ -282,11 +289,14 @@ class Chaos(Optimizer):
                 optim_names.append(name)
                 state = self.state[p]
                 if "momentum" not in state:
-                    state["momentum"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state["momentum"] = torch.zeros_like(
+                        p, memory_format=torch.preserve_format
+                    )
             group_slices.append((start, len(optim_params)))
 
         if not optim_params:
-            return torch.zeros((), dtype=torch.float32)
+            empty: list[Tensor] = []
+            return empty, empty, [], torch.zeros((), dtype=torch.float32)
 
         device = optim_params[0].device
         eps_std = self.perturbation_std
@@ -326,20 +336,19 @@ class Chaos(Optimizer):
                 del minus
                 offset += k_c
 
-            if self.fitness_shaping:
-                coefs = _centered_rank_coef(all_loss_plus, all_loss_minus, inv_2eps_sq)
-            else:
-                coefs = (all_loss_plus - all_loss_minus) * inv_2eps_sq
-
+            coefs = (
+                _centered_rank_coef(all_loss_plus, all_loss_minus, inv_2eps_sq)
+                if self.fitness_shaping
+                else (all_loss_plus - all_loss_minus) * inv_2eps_sq
+            )
             for g, noise in zip(grad_acc, all_noises):
                 g.add_((coefs @ noise.view(K, -1)).view(g.shape))
-
             mean_loss = all_loss_plus.sum() / K
+
         else:
             # Standard single-phase chunked loop: noise is generated and freed
             # chunk-by-chunk so peak memory scales with chunk size, not K.
             loss_plus_sum = torch.zeros((), device=device, dtype=optim_params[0].dtype)
-
             offset = 0
             while offset < K:
                 k_c = min(M, K - offset)
@@ -347,28 +356,126 @@ class Chaos(Optimizer):
                     torch.randn(k_c, *p.shape, device=device, dtype=p.dtype) * eps_std
                     for p in optim_params
                 ]
-
                 plus = tuple(p.unsqueeze(0) + n for p, n in zip(optim_params, noises_c))
                 loss_plus = vmap_loss(plus)
                 del plus
-
                 minus = tuple(p.unsqueeze(0) - n for p, n in zip(optim_params, noises_c))
                 loss_minus = vmap_loss(minus)
                 del minus
-
                 coef = (loss_plus - loss_minus) * inv_2eps_sq
                 loss_plus_sum = loss_plus_sum + loss_plus.sum()
                 del loss_minus
-
                 for g, noise in zip(grad_acc, noises_c):
                     g.add_((coef @ noise.view(k_c, -1)).view(g.shape))
-
                 del noises_c, coef, loss_plus
                 offset += k_c
-
             mean_loss = loss_plus_sum / K
 
         torch._foreach_div_(grad_acc, float(K))
+        return optim_params, grad_acc, group_slices, mean_loss
+
+    @torch.no_grad()
+    def estimate_grad(
+        self,
+        model: nn.Module,
+        criterion: Callable[..., Tensor],
+        *args,
+        **kwargs,
+    ) -> Tensor:
+        """Compute the ES gradient estimate and accumulate it into ``param.grad``.
+
+        Runs the same vmap ES forward passes as :meth:`step` but writes the
+        resulting per-parameter gradient estimate into ``param.grad``
+        (accumulating, like ``loss.backward()``) instead of applying the LARS
+        momentum update. Call ``optimizer.zero_grad()`` before this method when
+        you want a fresh estimate rather than accumulation.
+
+        This unlocks three usage patterns beyond the standalone :meth:`step`:
+
+        **1. Pair with any standard optimizer (recommended for Lightning):**
+
+        .. code-block:: python
+
+            chaos = Chaos(model.parameters(), num_perturbations=16)
+            adamw = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+            for data, target in dataloader:
+                adamw.zero_grad()
+                loss = chaos.estimate_grad(model, loss_fn, data, target)
+                adamw.step()
+
+        **2. Gradient-free RL / black-box objectives (no backward needed):**
+
+        .. code-block:: python
+
+            chaos = Chaos(model.parameters())
+            adamw = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+            for state in env:
+                adamw.zero_grad()
+                mean_return = chaos.estimate_grad(model, rollout_fn, state)
+                adamw.step()
+
+        **3. Mix ES gradients with backprop gradients:**
+
+        .. code-block:: python
+
+            adamw.zero_grad()
+            loss = chaos.estimate_grad(model, loss_fn, data, target)
+            # compute your own loss outside no_grad for backward():
+            loss_bp = loss_fn(model(data), target)
+            loss_bp.backward()   # accumulates on top of the ES estimate
+            adamw.step()
+
+        Args:
+            model: PyTorch module whose parameters are being optimized.
+            criterion: callable returning a scalar loss from the model output.
+            *args: forwarded to the model and criterion (same as :meth:`step`).
+            **kwargs: forwarded to the criterion.
+
+        Returns:
+            Mean of ``L(θ+δ_k)`` across the K perturbation samples (a detached
+            scalar tensor — not differentiable; use your own forward pass if
+            you need ``loss.backward()``).
+        """
+        optim_params, grad_acc, _, mean_loss = self._run_es(
+            model, criterion, *args, **kwargs
+        )
+        for p, g in zip(optim_params, grad_acc):
+            if p.grad is None:
+                p.grad = g.clone()
+            else:
+                p.grad.add_(g)
+        return mean_loss
+
+    @torch.no_grad()
+    def step(self, model: nn.Module, criterion: Callable[..., Tensor], *args, **kwargs) -> Tensor:  # type: ignore[override]
+        """Perform a single optimization step using the LARS-style update rule.
+
+        Runs ES forward passes via :meth:`_run_es`, applies optional gradient
+        clipping, updates the per-parameter momentum buffers, and takes a
+        trust-ratio-rescaled step. Weight decay is applied per-group after the
+        ES update.
+
+        Only parameters registered in this optimizer's ``param_groups`` are
+        perturbed and updated; any other ``requires_grad=True`` parameters on
+        the model are held at their current values during the forward pass.
+
+        Args:
+            model: PyTorch module whose parameters are being optimized.
+            criterion: callable computing the scalar loss from model outputs.
+            *args: positional arguments forwarded to the model and criterion.
+            **kwargs: keyword arguments forwarded to the criterion.
+
+        Returns:
+            Mean of ``L(θ+δ)`` across the perturbation samples used in the step.
+        """
+        optim_params, grad_acc, group_slices, mean_loss = self._run_es(
+            model, criterion, *args, **kwargs
+        )
+
+        if not optim_params:
+            return mean_loss
 
         # Gradient clipping: scale the ES gradient to at most grad_clip in L2
         # norm. Implemented as a tensor multiply to avoid a GPU→CPU sync.
@@ -410,6 +517,8 @@ class Chaos(Optimizer):
             scaled = torch._foreach_mul(group_mems, scale)
             torch._foreach_add_(group_params, scaled)
             if group["weight_decay"] > 0.0:
-                torch._foreach_mul_(group_params, 1.0 - group["lr"] * group["weight_decay"])
+                torch._foreach_mul_(
+                    group_params, 1.0 - group["lr"] * group["weight_decay"]
+                )
 
         return mean_loss

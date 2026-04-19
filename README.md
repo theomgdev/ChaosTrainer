@@ -46,6 +46,11 @@ pytest
 
 ## Usage
 
+### Standalone ES optimizer
+
+The simplest path: `Chaos.step` drives every forward pass itself and applies
+the LARS-style update — no `loss.backward()` needed.
+
 ```python
 import torch
 from torch import nn
@@ -68,6 +73,49 @@ for step in range(3_000):
     loss = optimizer.step(model, loss_fn, X, Y).item()
     if loss < 1e-4:
         break
+```
+
+### Pair with any standard optimizer (`estimate_grad`)
+
+`estimate_grad` runs the same ES forward passes but writes the gradient
+estimate into `param.grad` instead of applying the update — exactly like
+`loss.backward()`. This lets any PyTorch optimizer consume the ES gradient:
+
+```python
+chaos = Chaos(model.parameters(), num_perturbations=16)
+adamw = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+for data, target in dataloader:
+    adamw.zero_grad()
+    loss = chaos.estimate_grad(model, loss_fn, data, target)
+    adamw.step()
+```
+
+### Gradient-free RL / black-box objectives
+
+No `backward()` needed at all — the reward signal never touches autograd:
+
+```python
+chaos = Chaos(model.parameters())
+adamw = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+for state in env:
+    adamw.zero_grad()
+    mean_return = chaos.estimate_grad(model, rollout_fn, state)
+    adamw.step()
+```
+
+### Mix ES gradients with backprop
+
+Both signal sources accumulate into `param.grad` before the update step:
+
+```python
+adamw.zero_grad()
+es_loss = chaos.estimate_grad(model, loss_fn, data, target)
+# compute loss outside no_grad for backward:
+bp_loss = loss_fn(model(data), target)
+bp_loss.backward()  # adds onto the ES estimate already in .grad
+adamw.step()
 ```
 
 ## Algorithm
@@ -186,11 +234,16 @@ and `orthogonal_perturbations` are optimizer-level flags.
   halves activation memory and unlocks TensorCore acceleration without any
   autocast wrapper.
 
-## Running the example
+## Running the examples
 
 ```bash
+# Standalone ES (LARS update)
 python examples/xor.py
 python examples/xor.py --device cuda
+
+# estimate_grad + AdamW
+python examples/xor_adamw.py
+python examples/xor_adamw.py --device cuda
 ```
 
 ## License
