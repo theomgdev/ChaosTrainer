@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-04-19
+
+### Added
+- `perturbation_std` hyperparameter on `Chaos`. Controls the standard deviation
+  `ε` of the Gaussian perturbation `δ ~ N(0, ε² I)`. Useful for fp16 training
+  (lower toward `1e-4` to stay above the FP noise floor) or noisy loss surfaces
+  (raise toward `1e-2`). Default `1e-3` is unchanged from prior releases.
+  Stored in `defaults` and round-trips through `state_dict()`.
+
 ## [0.1.2] - 2026-04-19
 
 ### Added

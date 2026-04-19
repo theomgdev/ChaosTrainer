@@ -35,6 +35,8 @@ def test_rejects_missing_arguments():
         {"num_perturbations": 0},
         {"perturbation_chunk_size": 0},
         {"perturbation_chunk_size": -1},
+        {"perturbation_std": 0.0},
+        {"perturbation_std": -1e-3},
     ],
 )
 def test_rejects_invalid_hyperparameters(kwargs):
@@ -55,6 +57,19 @@ def test_parameter_groups_accept_overrides():
     assert opt.param_groups[0]["beta"] == 0.5
     assert opt.param_groups[1]["lr"] == 2.0
     assert opt.param_groups[1]["beta"] == 0.9  # default inherited
+
+
+def test_perturbation_std_stored_and_used():
+    model = nn.Linear(4, 2)
+    opt = Chaos(model.parameters(), lr=1e-2, perturbation_std=5e-3)
+    assert opt.perturbation_std == 5e-3
+    assert opt.param_groups[0]["perturbation_std"] == 5e-3
+
+    def criterion(outputs):
+        return outputs.pow(2).mean()
+
+    loss = opt.step(model, criterion, torch.randn(4, 4))
+    assert torch.isfinite(loss)
 
 
 # ---------------------------------------------------------------------------

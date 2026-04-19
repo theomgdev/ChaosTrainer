@@ -105,15 +105,11 @@ Each step:
 | `beta`                      | `0.9`   | Momentum decay on the gradient estimate. |
 | `num_perturbations`         | `1`     | Samples averaged per step. |
 | `perturbation_chunk_size`   | `None`  | Micro-batch size for the vmap forward (caps peak VRAM). `None` ⇒ one chunk of size `num_perturbations`. |
+| `perturbation_std`          | `1e-3`  | Standard deviation `ε` of `δ ~ N(0, ε² I)`. The estimator variance is independent of `ε`; bias vanishes as `O(ε²)`. |
 
 `lr` and `beta` are per-parameter-group and can be overridden via the standard
-PyTorch `param_groups` mechanism. `num_perturbations` and
-`perturbation_chunk_size` are optimizer-level flags.
-
-The perturbation std `ε = 1e-3` is a fixed internal constant. The variance of
-the central-difference ES estimator is independent of `ε`, and its bias
-vanishes as `O(ε²)`, so this value works across model scales for fp32 and
-mixed-precision (AMP) training without tuning.
+PyTorch `param_groups` mechanism. `num_perturbations`, `perturbation_chunk_size`,
+and `perturbation_std` are optimizer-level flags.
 
 ### Tuning tips
 
@@ -123,6 +119,9 @@ mixed-precision (AMP) training without tuning.
   (`0.95 – 0.99`) for smoother trajectories in flat regions.
 - Increase `num_perturbations` when the gradient estimate is too noisy and
   convergence stalls — cost scales linearly.
+- Adjust `perturbation_std` only when the default `1e-3` fails: lower toward
+  `1e-4` for fp16 training (to stay above the FP noise floor); raise toward
+  `1e-2` for very noisy or flat loss surfaces.
 
 ### Performance & VRAM Optimization (Pro Tips)
 

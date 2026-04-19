@@ -16,11 +16,7 @@ from torch.optim.optimizer import Optimizer
 __all__ = ["Chaos"]
 
 
-# Perturbation scale for the antithetic finite-difference estimator.
-# Fixed at ~sqrt(fp32 machine epsilon); variance of the estimator is
-# independent of this value and bias vanishes as O(ε²), so exposing it
-# as a hyperparameter adds no useful knob for fp32/AMP training.
-_PERTURBATION_STD: float = 1e-3
+_PERTURBATION_STD: float = 1e-3  # default perturbation scale
 
 # Numerical-stability floor inside the global norms. Only matters on the very
 # first step, before momentum is populated, where ‖m‖ is exactly zero. Outside
@@ -71,6 +67,13 @@ class Chaos(Optimizer):
             ``num_perturbations``) while keeping vmap amortization. ``None``
             means one chunk of size ``num_perturbations`` (no chunking).
             Default: ``None``.
+        perturbation_std: standard deviation ``ε`` of the Gaussian perturbation
+            ``δ ~ N(0, ε² I)``. The central-difference estimator's variance is
+            independent of this value and its bias vanishes as ``O(ε²)``, so
+            ``1e-3`` works well for fp32 and AMP training. Decrease toward
+            ``1e-4`` for fp16 to stay above the FP noise floor; increase toward
+            ``1e-2`` for very noisy loss surfaces. Must be positive.
+            Default: ``1e-3``.
 
     Example:
         >>> import torch
@@ -108,6 +111,7 @@ class Chaos(Optimizer):
         *,
         num_perturbations: int = 1,
         perturbation_chunk_size: int | None = None,
+        perturbation_std: float = _PERTURBATION_STD,
     ) -> None:
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -119,6 +123,8 @@ class Chaos(Optimizer):
             raise ValueError(
                 f"Invalid perturbation_chunk_size: {perturbation_chunk_size}"
             )
+        if perturbation_std <= 0.0:
+            raise ValueError(f"Invalid perturbation_std: {perturbation_std} (must be > 0)")
 
         defaults = dict(
             lr=lr,
@@ -129,6 +135,7 @@ class Chaos(Optimizer):
                 if perturbation_chunk_size is not None
                 else None
             ),
+            perturbation_std=float(perturbation_std),
         )
         super().__init__(params, defaults)
         self.num_perturbations = int(num_perturbations)
@@ -137,6 +144,7 @@ class Chaos(Optimizer):
             if perturbation_chunk_size is not None
             else None
         )
+        self.perturbation_std = float(perturbation_std)
 
     @torch.no_grad()
     def step(self, model: nn.Module, criterion: Callable[..., Tensor], *args, **kwargs) -> Tensor:  # type: ignore[override]
@@ -185,7 +193,7 @@ class Chaos(Optimizer):
             return torch.zeros((), dtype=torch.float32)
 
         device = optim_params[0].device
-        eps_std = _PERTURBATION_STD
+        eps_std = self.perturbation_std
         inv_2eps_sq = 1.0 / (2.0 * eps_std * eps_std)
 
         K = self.num_perturbations
