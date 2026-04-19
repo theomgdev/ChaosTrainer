@@ -37,6 +37,9 @@ def test_rejects_missing_arguments():
         {"perturbation_chunk_size": -1},
         {"perturbation_std": 0.0},
         {"perturbation_std": -1e-3},
+        {"weight_decay": -0.1},
+        {"grad_clip": 0.0},
+        {"grad_clip": -1.0},
     ],
 )
 def test_rejects_invalid_hyperparameters(kwargs):
@@ -57,6 +60,7 @@ def test_parameter_groups_accept_overrides():
     assert opt.param_groups[0]["beta"] == 0.5
     assert opt.param_groups[1]["lr"] == 2.0
     assert opt.param_groups[1]["beta"] == 0.9  # default inherited
+    assert opt.param_groups[0]["weight_decay"] == 0.0  # default inherited
 
 
 def test_perturbation_std_stored_and_used():
@@ -401,3 +405,169 @@ def test_runs_on_cuda():
     for p in model.parameters():
         assert p.device.type == "cuda"
         assert opt.state[p]["momentum"].device.type == "cuda"
+
+
+# ---------------------------------------------------------------------------
+# Weight decay
+# ---------------------------------------------------------------------------
+
+
+def test_weight_decay_regularizes_parameters():
+    """With a flat (constant) loss, weight decay should shrink parameter norms."""
+    torch.manual_seed(0)
+
+    class ConstantModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.x = nn.Parameter(torch.ones(8) * 2.0)
+
+        def forward(self, _=None):
+            return self.x
+
+    model = ConstantModel()
+    opt = Chaos(model.parameters(), lr=1e-2, weight_decay=0.5, num_perturbations=4)
+
+    def criterion(x):
+        return torch.tensor(1.0)  # constant — no ES gradient signal
+
+    norm_before = model.x.norm().item()
+    for _ in range(50):
+        opt.step(model, criterion)
+    norm_after = model.x.norm().item()
+
+    assert norm_after < norm_before
+
+
+# ---------------------------------------------------------------------------
+# Gradient clipping
+# ---------------------------------------------------------------------------
+
+
+def test_grad_clip_convergence():
+    """With grad_clip enabled the optimizer should still converge."""
+    class QuadraticModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.x = nn.Parameter(torch.tensor([3.0, -2.0]))
+
+        def forward(self, _=None):
+            return self.x
+
+    model = QuadraticModel()
+    opt = Chaos(model.parameters(), lr=1e-2, num_perturbations=4, grad_clip=1.0)
+
+    def criterion(x):
+        return (x ** 2).sum()
+
+    start = criterion(model.x).item()
+    for _ in range(300):
+        opt.step(model, criterion)
+    end = criterion(model.x).item()
+    assert end < start * 0.5
+
+
+# ---------------------------------------------------------------------------
+# Fitness shaping
+# ---------------------------------------------------------------------------
+
+
+def test_fitness_shaping_converges_on_quadratic():
+    class QuadraticModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.x = nn.Parameter(torch.tensor([3.0, -2.0, 1.5]))
+
+        def forward(self, _=None):
+            return self.x
+
+    model = QuadraticModel()
+    opt = Chaos(
+        model.parameters(), lr=1e-2, num_perturbations=4, fitness_shaping=True
+    )
+
+    def criterion(x):
+        return (x ** 2).sum()
+
+    start = criterion(model.x).item()
+    for _ in range(300):
+        opt.step(model, criterion)
+    end = criterion(model.x).item()
+    assert end < start * 0.5
+
+
+def test_fitness_shaping_k1_edge_case():
+    """K=1 means only 2 loss values ranked; step must still be finite."""
+    torch.manual_seed(0)
+    model = nn.Linear(4, 2)
+    opt = Chaos(model.parameters(), lr=1e-2, num_perturbations=1, fitness_shaping=True)
+
+    def criterion(outputs):
+        return outputs.pow(2).mean()
+
+    loss = opt.step(model, criterion, torch.randn(4, 4))
+    assert torch.isfinite(loss)
+    for p in model.parameters():
+        assert torch.isfinite(p).all()
+
+
+# ---------------------------------------------------------------------------
+# Orthogonal perturbations
+# ---------------------------------------------------------------------------
+
+
+def test_orthogonal_perturbations_converges_on_quadratic():
+    class QuadraticModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.x = nn.Parameter(torch.tensor([3.0, -2.0, 1.5]))
+
+        def forward(self, _=None):
+            return self.x
+
+    model = QuadraticModel()
+    opt = Chaos(
+        model.parameters(), lr=1e-2, num_perturbations=4, orthogonal_perturbations=True
+    )
+
+    def criterion(x):
+        return (x ** 2).sum()
+
+    start = criterion(model.x).item()
+    for _ in range(300):
+        opt.step(model, criterion)
+    end = criterion(model.x).item()
+    assert end < start * 0.5
+
+
+# ---------------------------------------------------------------------------
+# Combined enhanced features
+# ---------------------------------------------------------------------------
+
+
+def test_fitness_shaping_and_orthogonal_combined():
+    """Both flags enabled together must converge."""
+    class QuadraticModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.x = nn.Parameter(torch.tensor([2.0, -1.5]))
+
+        def forward(self, _=None):
+            return self.x
+
+    model = QuadraticModel()
+    opt = Chaos(
+        model.parameters(),
+        lr=1e-2,
+        num_perturbations=4,
+        fitness_shaping=True,
+        orthogonal_perturbations=True,
+    )
+
+    def criterion(x):
+        return (x ** 2).sum()
+
+    start = criterion(model.x).item()
+    for _ in range(300):
+        opt.step(model, criterion)
+    end = criterion(model.x).item()
+    assert end < start * 0.5

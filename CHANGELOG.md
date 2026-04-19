@@ -5,6 +5,41 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-04-19
+
+### Added
+- `weight_decay` hyperparameter on `Chaos`. Decoupled L2 regularization
+  applied per parameter-group as `θ ← θ · (1 − lr · λ)` after each ES step,
+  in the spirit of AdamW. Default `0.0` (disabled). Stored in `defaults` and
+  therefore per-group-overridable.
+- `grad_clip` hyperparameter on `Chaos`. Clips the global L2 norm of the ES
+  gradient estimate to this threshold before the momentum update, preventing
+  runaway steps on noisy or sparse objectives. Implemented via a tensor
+  multiply so no GPU→CPU sync is required. Default `None` (disabled).
+- `fitness_shaping` flag on `Chaos`. When enabled, replaces raw loss
+  differences with centered rank scores computed over all `2 · num_perturbations`
+  evaluations before forming the gradient estimate. Makes the optimizer
+  invariant to monotonic transformations of the loss (e.g. shifted or scaled
+  rewards), which is especially valuable for RL-style or highly non-stationary
+  objectives. Default `False`.
+- `orthogonal_perturbations` flag on `Chaos`. When enabled, generates
+  perturbation directions via QR orthogonalization (in float32 for numerical
+  stability) per parameter, so the `num_perturbations` noise vectors span
+  orthogonal subspaces. Reduces estimator variance compared to i.i.d. Gaussian
+  at the same sample count. Falls back to i.i.d. when
+  `num_perturbations > param.numel()`. Default `False`.
+- `_generate_noises` private helper encapsulates noise generation (i.i.d. or
+  orthogonal) for the two-phase code path.
+- `_centered_rank_coef` module-level helper implements the centered rank
+  transform over the `2K` antithetic losses.
+
+### Changed
+- `step()` now branches on `fitness_shaping or orthogonal_perturbations`: the
+  enhanced path pre-generates all `K` noise tensors and collects all `2K`
+  losses before computing coefficients (`O(K · |θ|)` additional noise memory;
+  `perturbation_chunk_size` still governs peak activation VRAM). The standard
+  path is unchanged.
+
 ## [0.1.3] - 2026-04-19
 
 ### Added
