@@ -21,9 +21,9 @@ from chaostrainer import Chaos
 def main() -> None:
     parser = argparse.ArgumentParser(description="Chaos optimizer XOR demo.")
     parser.add_argument("--device", default="cpu", help="torch device, e.g. cpu / cuda / mps")
-    parser.add_argument("--epochs", type=int, default=15000)
+    parser.add_argument("--epochs", type=int, default=3000)
     parser.add_argument("--lr", type=float, default=1e-2)
-    parser.add_argument("--num-perturbations", type=int, default=1)
+    parser.add_argument("--num-perturbations", type=int, default=8)
     parser.add_argument(
         "--perturbation-chunk-size",
         type=int,
@@ -86,7 +86,7 @@ def main() -> None:
             print(f"[{epoch:>5}] converged, loss={loss:.6f}, Time/Step: {step_t:.4f}s")
             converged_epoch = epoch
             break
-        if epoch % 1500 == 0:
+        if epoch % 500 == 0:
             print(f"[{epoch:>5}] loss={loss:.6f}, Time/Step: {step_t:.4f}s")
 
     if converged_epoch is None:

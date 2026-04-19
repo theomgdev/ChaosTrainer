@@ -64,7 +64,7 @@ Y = torch.tensor([[0.], [1.], [1.], [0.]])
 loss_fn = nn.MSELoss()
 optimizer = Chaos(model.parameters(), lr=1e-2)
 
-for step in range(15_000):
+for step in range(3_000):
     loss = optimizer.step(model, loss_fn, X, Y).item()
     if loss < 1e-4:
         break
@@ -179,9 +179,12 @@ and `orthogonal_perturbations` are optimizer-level flags.
 - **`torch.compile()` is your best friend:** Wrapping `model = torch.compile(model)`
   fuses the vmapped forward into a single kernel, dramatically speeding up
   large `num_perturbations` runs.
-- **Native Automatic Mixed Precision (AMP):** Since no autograd graph is kept,
-  running forward passes under `torch.autocast` in `fp16` / `bf16` halves the
-  memory footprint and unlocks TensorCore acceleration.
+- **Automatic Mixed Precision (AMP):** Since Chaos drives its own forward passes
+  internally, user-level `torch.autocast` contexts do not wrap them. To use
+  AMP, convert the model to `fp16` or `bf16` directly (e.g.
+  `model.to(torch.bfloat16)`) before passing it to `optimizer.step`. This
+  halves activation memory and unlocks TensorCore acceleration without any
+  autocast wrapper.
 
 ## Running the example
 

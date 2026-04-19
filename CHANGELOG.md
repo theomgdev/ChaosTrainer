@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-04-20
+
+### Fixed
+- `vmap` was constructed without `randomness="different"`, causing a hard crash
+  when the model contains stochastic layers (e.g. `nn.Dropout`). Changed to
+  `randomness="different"` so each of the K vectorized evaluations receives an
+  independent RNG stream. Models without stochastic layers are unaffected.
+
+### Changed
+- `examples/xor.py` default `--num-perturbations` corrected from `1` to `8`
+  to match the library default and produce representative out-of-the-box
+  results. Default `--epochs` reduced from `15000` to `3000` (with K=8 and
+  the default fitness-shaping + orthogonal settings, convergence is reliably
+  faster). Log interval adjusted to every 500 steps.
+- README AMP section corrected: `torch.autocast` contexts do not wrap the
+  optimizer's internal `vmap` forward passes. The section now advises converting
+  the model dtype directly (`model.to(torch.bfloat16)`) rather than using an
+  autocast wrapper. Usage example loop count updated from `15_000` to `3_000`.
+- Added a docstring note clarifying that only `lr`, `beta`, and `weight_decay`
+  are per-param-group overridable; all other hyperparameters are optimizer-wide.
+
 ## [0.3.0] - 2026-04-20
 
 ### Changed

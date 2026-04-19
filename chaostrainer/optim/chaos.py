@@ -139,6 +139,10 @@ class Chaos(Optimizer):
         of :math:`L(\theta+\delta_k)` across the ``num_perturbations`` samples
         used in the step.
 
+        Only ``lr``, ``beta``, and ``weight_decay`` can be overridden per
+        param-group; all other hyperparameters are optimizer-wide and shared
+        across all groups.
+
     References:
         Salimans et al. 2017, *Evolution Strategies as a Scalable Alternative
         to Reinforcement Learning*. https://arxiv.org/abs/1703.03864
@@ -295,7 +299,7 @@ class Chaos(Optimizer):
             out = functional_call(model, params_mapping, args[:1])
             return criterion(out, *args[1:], **kwargs)
 
-        vmap_loss = vmap(compute_loss, in_dims=(0,))
+        vmap_loss = vmap(compute_loss, in_dims=(0,), randomness="different")
         grad_acc: list[Tensor] = [torch.zeros_like(p) for p in optim_params]
 
         if self.fitness_shaping or self.orthogonal_perturbations:
