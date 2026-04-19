@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-04-20
+
+### Changed
+- `num_perturbations` default changed from `1` to `8`. Single-sample estimates
+  are extremely noisy in practice; 8 samples give reliable convergence on most
+  objectives at a compute cost that remains acceptable for ES-sized models.
+- `fitness_shaping` default changed from `False` to `True`. Centered rank
+  transform is strictly more robust than raw loss differences — it costs no
+  additional forward passes and makes convergence invariant to loss scale and
+  monotonic transformations. Disable only to reproduce raw-estimator baselines.
+- `orthogonal_perturbations` default changed from `False` to `True`.
+  Orthogonal directions explore the loss landscape more systematically than
+  i.i.d. Gaussian at the same sample count, with negligible QR overhead for
+  ES-sized models. The i.i.d. fallback remains automatic when
+  `num_perturbations > param.numel()`.
+
 ## [0.2.0] - 2026-04-19
 
 ### Added

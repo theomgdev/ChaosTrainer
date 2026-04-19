@@ -78,17 +78,18 @@ class Chaos(Optimizer):
             step, parameters are shrunk as ``θ ← θ · (1 − lr · λ)``, in the
             spirit of AdamW. Applied per-group. Default: ``0.0``.
         num_perturbations: number of perturbation samples averaged per step.
-            More samples reduce variance linearly at proportional cost.
-            Default: ``1``.
+            More samples reduce estimator variance linearly at proportional
+            forward-pass cost. 8 is the default; lower to 1–2 only when compute
+            is extremely tight, raise to 16–64 for high-variance objectives.
+            Default: ``8``.
         perturbation_chunk_size: if set, evaluates perturbations in chunks of
             this size instead of a single vmap over all ``num_perturbations``.
             Caps peak activation VRAM (activations scale with the chunk size,
             not ``num_perturbations``) while keeping vmap amortization. ``None``
             means one chunk of size ``num_perturbations`` (no chunking).
-            Note: when ``fitness_shaping`` or ``orthogonal_perturbations`` is
-            enabled, all ``num_perturbations`` noise tensors are held in memory
-            simultaneously regardless of this setting.
-            Default: ``None``.
+            Note: all ``num_perturbations`` noise tensors are held in memory
+            simultaneously regardless of this setting (due to the two-phase
+            path used by default). Default: ``None``.
         perturbation_std: standard deviation ``ε`` of the Gaussian perturbation
             ``δ ~ N(0, ε² I)``. The central-difference estimator's variance is
             independent of this value and its bias vanishes as ``O(ε²)``, so
@@ -104,20 +105,19 @@ class Chaos(Optimizer):
             centered rank scores computed over all ``2 · num_perturbations``
             evaluations before forming the gradient estimate. This makes the
             optimizer invariant to monotonic transformations of the loss (e.g.
-            shifted or scaled rewards) and is especially valuable for RL-style
-            or highly non-stationary objectives. When enabled, all
-            ``num_perturbations`` noise tensors are held in memory
-            simultaneously (``O(K · |θ|)`` additional cost).
-            Default: ``False``.
+            shifted or scaled rewards) — valuable for RL-style or non-stationary
+            objectives and as a general robustness measure. Set to ``False``
+            only when reproducing results that used raw loss differences, or
+            when ``num_perturbations`` is very small and the fixed-magnitude
+            coefficient at K=1 is undesirable. Default: ``True``.
         orthogonal_perturbations: if ``True``, generates perturbation directions
-            via QR orthogonalization (per parameter), so the
-            ``num_perturbations`` noise vectors span orthogonal subspaces.
-            Reduces estimator variance compared to i.i.d. Gaussian noise at the
-            same sample count. Falls back to i.i.d. when
-            ``num_perturbations > param.numel()``. When enabled, all
-            ``num_perturbations`` noise tensors are held in memory
-            simultaneously (``O(K · |θ|)`` additional cost).
-            Default: ``False``.
+            via QR orthogonalization (per parameter, in float32 for numerical
+            stability), so the ``num_perturbations`` noise vectors span
+            orthogonal subspaces. Reduces estimator variance compared to i.i.d.
+            Gaussian at the same sample count. Falls back to i.i.d. when
+            ``num_perturbations > param.numel()``. Set to ``False`` only when
+            reproducing i.i.d.-Gaussian baselines or when the QR cost matters
+            at very large ``num_perturbations``. Default: ``True``.
 
     Example:
         >>> import torch
@@ -154,12 +154,12 @@ class Chaos(Optimizer):
         beta: float = 0.9,
         weight_decay: float = 0.0,
         *,
-        num_perturbations: int = 1,
+        num_perturbations: int = 8,
         perturbation_chunk_size: int | None = None,
         perturbation_std: float = 1e-3,
         grad_clip: float | None = None,
-        fitness_shaping: bool = False,
-        orthogonal_perturbations: bool = False,
+        fitness_shaping: bool = True,
+        orthogonal_perturbations: bool = True,
     ) -> None:
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")

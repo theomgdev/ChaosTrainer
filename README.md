@@ -74,24 +74,33 @@ for step in range(15_000):
 
 Each step:
 
-1. Sample `δ_k ~ N(0, ε² I)` independently for every parameter, for
-   `k = 1 … num_perturbations`.
-2. Evaluate `L(θ + δ_k)` and `L(θ − δ_k)` in parallel via `vmap` over the
-   perturbation dimension — one vmapped forward pass for the plus batch and
-   one for the minus batch, regardless of `num_perturbations`.
-3. Form the antithetic Evolution-Strategy estimator and average across samples:
+1. Sample `δ_k` for every parameter, `k = 1 … num_perturbations`. By default
+   (`orthogonal_perturbations=True`) the `K` directions per parameter are
+   orthogonalized via QR (in float32), so they span orthogonal subspaces and
+   cover the loss landscape more systematically than i.i.d. Gaussian noise.
+2. Evaluate `L(θ + δ_k)` and `L(θ − δ_k)` in parallel via `vmap` — one
+   vmapped forward pass per direction per chunk, amortizing Python dispatch
+   across all `perturbation_chunk_size` samples at once.
+3. Form the antithetic Evolution-Strategy gradient estimate and average across
+   samples. By default (`fitness_shaping=True`) raw losses are replaced by
+   centered rank scores over all `2K` evaluations before weighting:
+
+   ```
+   rank all 2K losses jointly → center to [−0.5, 0.5]
+   ĝ = mean_k [ (rank(L(θ+δ_k)) − rank(L(θ−δ_k))) · δ_k / (2 ε²) ]
+   ```
+
+   This makes the update invariant to any monotonic transformation of the
+   loss (rescaling, shifting, non-linear reward shaping). With raw losses
+   (`fitness_shaping=False`) the estimator is the standard:
 
    ```
    ĝ = mean_k [ (L(θ+δ_k) − L(θ−δ_k)) · δ_k / (2 ε²) ]
    ```
 
-   When `fitness_shaping=True`, raw losses are replaced by centered rank
-   scores over all `2K` evaluations before forming the estimate, making it
-   invariant to monotonic loss transformations.
-
 4. Update the momentum buffer `m ← β · m + ĝ`.
 5. Take a LARS-inspired step rescaled by the global weight-to-momentum norm
-   ratio
+   ratio:
 
    ```
    η = lr · ‖θ‖_global / ‖m‖_global
@@ -108,12 +117,12 @@ Each step:
 | `lr`                          | `1e-3`  | Effective per-step displacement as a fraction of `‖θ‖`. |
 | `beta`                        | `0.9`   | Momentum decay on the gradient estimate. |
 | `weight_decay`                | `0.0`   | Decoupled L2 regularization coefficient (AdamW-style). Applied per-group as `θ ← θ · (1 − lr · λ)` after the ES step. |
-| `num_perturbations`           | `1`     | Samples averaged per step. |
-| `perturbation_chunk_size`     | `None`  | Micro-batch size for the vmap forward (caps peak VRAM). `None` ⇒ one chunk of size `num_perturbations`. |
+| `num_perturbations`           | `8`     | Samples averaged per step. More samples reduce variance linearly at proportional forward-pass cost. |
+| `perturbation_chunk_size`     | `None`  | Micro-batch size for the vmap forward (caps peak activation VRAM). `None` ⇒ one chunk of size `num_perturbations`. |
 | `perturbation_std`            | `1e-3`  | Standard deviation `ε` of `δ ~ N(0, ε² I)`. The estimator variance is independent of `ε`; bias vanishes as `O(ε²)`. |
 | `grad_clip`                   | `None`  | Global L2 gradient norm clip threshold, applied before the momentum update. No GPU→CPU sync. |
-| `fitness_shaping`             | `False` | Replace raw loss differences with centered rank scores over all `2K` evaluations. Makes the update invariant to monotonic loss transformations. |
-| `orthogonal_perturbations`    | `False` | Orthogonalize the `K` noise directions per parameter via QR (in float32). Reduces estimator variance at the same sample count. Falls back to i.i.d. when `K > param.numel()`. |
+| `fitness_shaping`             | `True`  | Replace raw loss differences with centered rank scores over all `2K` evaluations. Makes the update invariant to monotonic loss transformations. |
+| `orthogonal_perturbations`    | `True`  | Orthogonalize the `K` noise directions per parameter via QR (in float32). Reduces estimator variance at the same sample count. Falls back to i.i.d. when `K > param.numel()`. |
 
 `lr`, `beta`, and `weight_decay` are per-parameter-group and can be overridden
 via the standard PyTorch `param_groups` mechanism. `num_perturbations`,
@@ -128,27 +137,29 @@ and `orthogonal_perturbations` are optimizer-level flags.
 
 ### Tuning tips
 
-- Start with defaults. Raise `lr` (e.g. `1e-2`) on small, well-conditioned
-  problems; lower it for fine-tuning or noisy objectives.
+- Start with defaults — they are calibrated for reliable convergence across
+  a broad range of tasks without any tuning.
+- Raise `lr` (e.g. `1e-2`) on small, well-conditioned problems; lower it
+  for fine-tuning or noisy objectives.
 - Lower `beta` (e.g. `0.5`) when rapid adaptation matters; raise it
   (`0.95 – 0.99`) for smoother trajectories in flat regions.
-- Increase `num_perturbations` when the gradient estimate is too noisy and
-  convergence stalls — cost scales linearly.
+- Lower `num_perturbations` (e.g. `2–4`) only when compute is very tight.
+  Raise it (e.g. `16–64`) on high-variance or high-dimensional objectives
+  where the default 8 samples leave the estimate noisy.
 - Adjust `perturbation_std` only when the default `1e-3` fails: lower toward
   `1e-4` for fp16 training (to stay above the FP noise floor); raise toward
   `1e-2` for very noisy or flat loss surfaces.
 - Use `weight_decay` (e.g. `1e-4`) as a regularizer for large models; it
   costs nothing extra and applies per-group.
-- Enable `grad_clip` (e.g. `1.0` or `10.0`) for objectives with occasional
+- Add `grad_clip` (e.g. `1.0` or `10.0`) for objectives with occasional
   extreme loss spikes or very high-variance gradient estimates.
-- Enable `fitness_shaping` when the loss scale shifts dramatically during
-  training (RL-style rewards, shifted baselines) or when the raw loss
-  magnitude is meaningless — rank invariance gives free robustness at no
-  sample-count cost.
-- Enable `orthogonal_perturbations` when `num_perturbations` is small (2–16)
-  and `param.numel()` is large; orthogonal directions explore the loss surface
-  more systematically than i.i.d. Gaussian. Combine with `fitness_shaping`
-  for the most stable gradient estimates.
+- Set `fitness_shaping=False` only when reproducing results from code that
+  used raw loss differences, or when the fixed-magnitude coefficient at
+  `num_perturbations=1` is undesirable.
+- Set `orthogonal_perturbations=False` only when reproducing i.i.d.-Gaussian
+  baselines, or when the QR cost is significant at very large
+  `num_perturbations`. The fallback to i.i.d. is automatic when
+  `num_perturbations > param.numel()`.
 
 ### Performance & VRAM Optimization (Pro Tips)
 
