@@ -39,7 +39,7 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-2)
-    parser.add_argument("--num-perturbations", type=int, default=1000)
+    parser.add_argument("--num-perturbations", type=int, default=8)
     parser.add_argument(
         "--perturbation-chunk-size",
         type=int,
