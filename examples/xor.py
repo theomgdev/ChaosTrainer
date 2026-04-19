@@ -1,10 +1,9 @@
-"""Train a tiny MLP on XOR with the Chaos optimizer.
+"""Train a tiny MLP on XOR with Chaos.
 
 Usage:
     python examples/xor.py
     python examples/xor.py --device cuda
-    python examples/xor.py --device cuda --compile
-    python examples/xor.py --compile --num-perturbations 16 --perturbation-chunk-size 4
+    python examples/xor.py --device cuda --compile --num-perturbations 16
 """
 
 from __future__ import annotations
@@ -19,21 +18,15 @@ from chaostrainer import Chaos
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Chaos optimizer XOR demo.")
-    parser.add_argument("--device", default="cpu", help="torch device, e.g. cpu / cuda / mps")
+    parser = argparse.ArgumentParser(description="Chaos XOR demo.")
+    parser.add_argument("--device", default="cpu")
     parser.add_argument("--epochs", type=int, default=15000)
     parser.add_argument("--lr", type=float, default=1e-2)
-    parser.add_argument("--num-perturbations", type=int, default=1)
-    parser.add_argument(
-        "--perturbation-chunk-size",
-        type=int,
-        default=None,
-        help="Cap peak VRAM by evaluating perturbations in chunks of this size.",
-    )
+    parser.add_argument("--num-perturbations", type=int, default=8)
     parser.add_argument(
         "--compile",
         action="store_true",
-        help="Wrap the model with torch.compile to fuse the vmapped forward pass.",
+        help="Wrap the model with torch.compile.",
     )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -55,25 +48,23 @@ def main() -> None:
     Y = torch.tensor([[0.0], [1.0], [1.0], [0.0]], device=device)
 
     loss_fn = nn.MSELoss()
+    # XOR needs non-zero weights in a 13-parameter MLP, so weight decay is
+    # disabled here. On real tasks leave the default (0.01) in place.
     optimizer = Chaos(
         model.parameters(),
         lr=args.lr,
         num_perturbations=args.num_perturbations,
-        perturbation_chunk_size=args.perturbation_chunk_size,
+        weight_decay=0.0,
     )
 
     total_params = sum(p.numel() for p in model.parameters())
     print(
         f"Device: {device} | Params: {total_params} | "
-        f"num_perturbations={args.num_perturbations} | "
-        f"chunk_size={args.perturbation_chunk_size} | "
-        f"compile={args.compile}"
+        f"num_perturbations={args.num_perturbations} | compile={args.compile}"
     )
 
     converged_epoch = None
     for epoch in range(1, args.epochs + 1):
-        # Synchronize so Time/Step reflects actual GPU compute, not just
-        # dispatch latency. First compiled step includes graph capture.
         if device.type == "cuda":
             torch.cuda.synchronize()
         start_t = time.time()

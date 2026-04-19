@@ -1,16 +1,8 @@
-"""Train a tiny model on MNIST using the gradient-free Chaos optimizer.
-
-Note: Chaos is an Evolution-Strategy optimizer designed for non-differentiable
-or black-box problems. Using it on a standard differentiable problem like
-MNIST with thousands of parameters is relatively inefficient compared to
-Adam/SGD, and is provided here purely to demonstrate the API on a standard 
-dataset.
+"""Train a linear classifier on MNIST with Chaos.
 
 Usage:
-    python examples/mnist.py
     python examples/mnist.py --device cuda
-    python examples/mnist.py --device cuda --compile
-    python examples/mnist.py --compile --perturbation-chunk-size 128
+    python examples/mnist.py --device cuda --compile --num-perturbations 10000
 """
 
 from __future__ import annotations
@@ -24,44 +16,37 @@ from torch.utils.data import DataLoader
 
 try:
     from torchvision import datasets, transforms
-except ImportError:
+except ImportError as e:
     raise ImportError(
         "torchvision is required to run the MNIST example. "
         "Please install it using: pip install torchvision"
-    )
+    ) from e
 
 from chaostrainer import Chaos
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Chaos optimizer MNIST demo.")
-    parser.add_argument("--device", default="cpu", help="torch device, e.g. cpu / cuda / mps")
+    parser = argparse.ArgumentParser(description="Chaos MNIST demo.")
+    parser.add_argument("--device", default="cpu")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--num-perturbations", type=int, default=1000)
     parser.add_argument(
-        "--perturbation-chunk-size",
-        type=int,
-        default=None,
-        help="Cap peak VRAM by evaluating perturbations in chunks of this size.",
-    )
-    parser.add_argument(
         "--compile",
         action="store_true",
-        help="Wrap the model with torch.compile to fuse the vmapped forward pass.",
+        help="Wrap the model with torch.compile.",
     )
+    parser.add_argument("--log-every", type=int, default=20, help="Log every N batches.")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
-    # We use a simple linear model to keep the parameter count (7850)
-    # small enough for zeroth-order approximation to remain viable.
     model = nn.Sequential(
         nn.Flatten(),
-        nn.Linear(28 * 28, 10)
+        nn.Linear(28 * 28, 10),
     ).to(device)
 
     if args.compile:
@@ -69,14 +54,22 @@ def main() -> None:
 
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
+        transforms.Normalize((0.1307,), (0.3081,)),
     ])
 
-    # Download and load the data
     train_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
     test_dataset = datasets.MNIST('./data', train=False, transform=transform)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=device.type == "cuda",
+        persistent_workers=True,
+        # Constant batch shape lets the CUDA path reuse its captured graph.
+        drop_last=True,
+    )
     test_loader = DataLoader(test_dataset, batch_size=1000, shuffle=False)
 
     loss_fn = nn.CrossEntropyLoss()
@@ -84,24 +77,20 @@ def main() -> None:
         model.parameters(),
         lr=args.lr,
         num_perturbations=args.num_perturbations,
-        perturbation_chunk_size=args.perturbation_chunk_size,
     )
 
     total_params = sum(p.numel() for p in model.parameters())
     print(
         f"Device: {device} | Params: {total_params} | "
-        f"num_perturbations={args.num_perturbations} | "
-        f"chunk_size={args.perturbation_chunk_size} | "
-        f"compile={args.compile}"
+        f"num_perturbations={args.num_perturbations} | compile={args.compile}"
     )
 
     for epoch in range(1, args.epochs + 1):
         model.train()
         for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.to(device), target.to(device)
+            data = data.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
 
-            # Synchronize so Time/Step reflects actual GPU compute, not just
-            # dispatch latency. First compiled step includes graph capture.
             if device.type == "cuda":
                 torch.cuda.synchronize()
             start_t = time.time()
@@ -110,12 +99,14 @@ def main() -> None:
                 torch.cuda.synchronize()
             step_t = time.time() - start_t
 
-            if batch_idx % 20 == 0:
-                print(f"Train Epoch: {epoch} "
-                      f"[{batch_idx * len(data):>5}/{len(train_loader.dataset)} "
-                      f"({100. * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss:.6f}\tTime/Step: {step_t:.4f}s")
+            if batch_idx % args.log_every == 0:
+                print(
+                    f"Train Epoch: {epoch} "
+                    f"[{batch_idx * len(data):>5}/{len(train_loader.dataset)} "
+                    f"({100. * batch_idx / len(train_loader):.0f}%)]\t"
+                    f"Loss: {loss:.6f}\tTime/Step: {step_t:.4f}s"
+                )
 
-        # Evaluation phase
         model.eval()
         test_loss = 0.0
         correct = 0
@@ -129,9 +120,11 @@ def main() -> None:
 
         test_loss /= len(test_loader)
         accuracy = 100. * correct / len(test_loader.dataset)
-        print(f"\n--- Test set results [Epoch {epoch}]: "
-              f"Average loss: {test_loss:.4f}, "
-              f"Accuracy: {correct}/{len(test_loader.dataset)} ({accuracy:.2f}%)\n")
+        print(
+            f"\n--- Test [Epoch {epoch}]: "
+            f"loss={test_loss:.4f}  "
+            f"accuracy={correct}/{len(test_loader.dataset)} ({accuracy:.2f}%)\n"
+        )
 
 
 if __name__ == "__main__":

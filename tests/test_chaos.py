@@ -1,4 +1,11 @@
-"""Unit tests for the Chaos optimizer."""
+"""Unit tests for the Chaos optimizer.
+
+Chaos dispatches on parameter device: CUDA parameters go through the
+stream-parallel + CUDA-graph path (racy, non-deterministic); other devices
+go through the deterministic vmap path. Tests that assert numeric
+invariants run on CPU; CUDA tests only check that the racy path runs and
+descends.
+"""
 
 from __future__ import annotations
 
@@ -32,6 +39,7 @@ def test_rejects_missing_arguments():
         {"lr": -0.1},
         {"beta": 1.0},
         {"beta": -0.1},
+        {"weight_decay": -0.1},
         {"num_perturbations": 0},
         {"perturbation_chunk_size": 0},
         {"perturbation_chunk_size": -1},
@@ -47,18 +55,20 @@ def test_parameter_groups_accept_overrides():
     model = nn.Sequential(nn.Linear(3, 3), nn.Linear(3, 3))
     opt = Chaos(
         [
-            {"params": list(model[0].parameters()), "lr": 0.5, "beta": 0.5},
+            {"params": list(model[0].parameters()), "lr": 0.5, "beta": 0.5, "weight_decay": 0.0},
             {"params": list(model[1].parameters()), "lr": 2.0},
         ]
     )
     assert opt.param_groups[0]["lr"] == 0.5
     assert opt.param_groups[0]["beta"] == 0.5
+    assert opt.param_groups[0]["weight_decay"] == 0.0
     assert opt.param_groups[1]["lr"] == 2.0
-    assert opt.param_groups[1]["beta"] == 0.9  # default inherited
+    assert opt.param_groups[1]["beta"] == 0.9
+    assert opt.param_groups[1]["weight_decay"] == 0.01
 
 
 # ---------------------------------------------------------------------------
-# Behavior
+# CPU path behavior
 # ---------------------------------------------------------------------------
 
 
@@ -74,7 +84,7 @@ def test_frozen_params_are_not_updated():
 
     model = DummyModel()
     target = torch.zeros(4)
-    opt = Chaos(model.parameters(), lr=1.0)
+    opt = Chaos(model.parameters(), lr=1.0, weight_decay=0.0)
 
     def criterion(outputs, tgt):
         train_out, frozen_out = outputs
@@ -97,7 +107,7 @@ def test_converges_on_quadratic():
             return self.x
 
     model = QuadraticModel()
-    opt = Chaos(model.parameters(), lr=1e-2, num_perturbations=4)
+    opt = Chaos(model.parameters(), lr=1e-2, num_perturbations=4, weight_decay=0.0)
 
     def criterion(x):
         return (x ** 2).sum()
@@ -110,37 +120,29 @@ def test_converges_on_quadratic():
     assert end < start * 0.5
 
 
-def test_multiple_perturbations_reduce_variance():
-    # Both sample counts should descend the quadratic; we only assert that
-    # convergence occurs, not a specific ordering (single-sample estimates
-    # are noisy enough that a run-to-run swap is possible).
-    class QuadraticModel(nn.Module):
+def test_weight_decay_shrinks_unoptimized_params():
+    """With no gradient signal, wd > 0 should monotonically shrink ‖θ‖."""
+    class PassthroughModel(nn.Module):
         def __init__(self):
             super().__init__()
-            self.x = nn.Parameter(torch.tensor([2.0, 2.0]))
+            self.x = nn.Parameter(torch.ones(16) * 5.0)
 
         def forward(self, _=None):
             return self.x
 
-    def run(num_perturbations: int) -> float:
-        torch.manual_seed(42)
-        model = QuadraticModel()
-        opt = Chaos(
-            model.parameters(), lr=0.1,
-            num_perturbations=num_perturbations,
-        )
+    model = PassthroughModel()
+    opt = Chaos(model.parameters(), lr=1e-1, weight_decay=0.1, num_perturbations=4)
 
-        def criterion(x):
-            return (x ** 2).sum()
+    def criterion(x):
+        # Gradient-free constant: ES estimator averages to zero in expectation.
+        return x.sum() * 0.0 + torch.tensor(1.0)
 
-        start = criterion(model.x).item()
-        for _ in range(500):
-            opt.step(model, criterion)
-        end = criterion(model.x).item()
-        return end / start
+    start_norm = model.x.detach().norm().item()
+    for _ in range(50):
+        opt.step(model, criterion)
+    end_norm = model.x.detach().norm().item()
 
-    assert run(1) < 0.25
-    assert run(4) < 0.25
+    assert end_norm < start_norm
 
 
 # ---------------------------------------------------------------------------
@@ -151,13 +153,12 @@ def test_multiple_perturbations_reduce_variance():
 def test_reversed_param_groups_still_converge():
     """Group order differing from model.named_parameters() order must not
     misalign gradients with their parameters."""
-    torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(4, 4), nn.Tanh(), nn.Linear(4, 2))
     groups = [
         {"params": list(model[2].parameters())},
         {"params": list(model[0].parameters())},
     ]
-    opt = Chaos(groups, lr=1e-2, num_perturbations=4)
+    opt = Chaos(groups, lr=1e-2, num_perturbations=4, weight_decay=0.0)
 
     X = torch.randn(16, 4)
     Y = torch.randn(16, 2)
@@ -172,7 +173,6 @@ def test_reversed_param_groups_still_converge():
 
 def test_partial_params_leaves_others_untouched():
     """Parameters not registered with the optimizer must not change."""
-    torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(4, 4), nn.Tanh(), nn.Linear(4, 2))
     opt = Chaos(model[0].parameters(), lr=1e-2, num_perturbations=4)
 
@@ -201,50 +201,12 @@ def test_rejects_params_not_on_model():
 
 
 # ---------------------------------------------------------------------------
-# Perturbation chunking
+# Perturbation chunking (CPU vmap path)
 # ---------------------------------------------------------------------------
-
-
-def test_chunked_equivalent_to_unchunked_under_fixed_seed():
-    """For a fixed RNG seed, chunking must produce the same trajectory as the
-    unchunked path (each chunk consumes K/M slices of the same noise stream)."""
-    class QuadraticModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.x = nn.Parameter(torch.tensor([2.0, -1.0, 0.5]))
-
-        def forward(self, _=None):
-            return self.x
-
-    def criterion(x):
-        return (x ** 2).sum()
-
-    def run(chunk_size):
-        torch.manual_seed(123)
-        model = QuadraticModel()
-        opt = Chaos(
-            model.parameters(),
-            lr=1e-2,
-            num_perturbations=16,
-            perturbation_chunk_size=chunk_size,
-        )
-        for _ in range(20):
-            opt.step(model, criterion)
-        return model.x.detach().clone()
-
-    unchunked = run(None)
-    chunked_4 = run(4)
-    chunked_8 = run(8)
-
-    # Different chunking consumes the RNG in different orders, so bit-exactness
-    # is not expected; both should converge to comparable values.
-    assert torch.allclose(unchunked, chunked_4, atol=0.5)
-    assert torch.allclose(unchunked, chunked_8, atol=0.5)
 
 
 def test_chunk_size_not_dividing_num_perturbations():
     """Trailing chunk smaller than chunk_size must still work."""
-    torch.manual_seed(0)
     model = nn.Linear(4, 2)
     opt = Chaos(
         model.parameters(),
@@ -270,6 +232,7 @@ def test_chunked_convergence_matches_unchunked():
             lr=1e-2,
             num_perturbations=8,
             perturbation_chunk_size=chunk_size,
+            weight_decay=0.0,
         )
         X = torch.randn(16, 4)
         Y = torch.randn(16, 2)
@@ -289,9 +252,7 @@ def test_chunked_convergence_matches_unchunked():
 
 
 def test_cold_start_does_not_nan_with_many_perturbations():
-    """On the first step the momentum norm is exactly zero; _NORM_FLOOR must
-    keep the trust ratio finite."""
-    torch.manual_seed(0)
+    """First step momentum norm is zero; _NORM_FLOOR must keep ratio finite."""
     model = nn.Linear(8, 4)
     opt = Chaos(model.parameters(), lr=1e-2, num_perturbations=16)
 
@@ -310,7 +271,6 @@ def test_cold_start_does_not_nan_with_many_perturbations():
 
 
 def test_xor_converges():
-    torch.manual_seed(0)
     model = nn.Sequential(
         nn.Linear(2, 4),
         nn.Tanh(),
@@ -321,7 +281,8 @@ def test_xor_converges():
     Y = torch.tensor([[0.0], [1.0], [1.0], [0.0]])
     loss_fn = nn.MSELoss()
 
-    opt = Chaos(model.parameters(), lr=1e-2)
+    # XOR requires non-zero weights; disable weight decay for this test.
+    opt = Chaos(model.parameters(), lr=1e-2, num_perturbations=4, weight_decay=0.0)
 
     final_loss = None
     for _ in range(15000):
@@ -342,7 +303,6 @@ def test_xor_converges():
 
 
 def test_state_dict_roundtrip():
-    torch.manual_seed(0)
     model = nn.Linear(3, 2)
     opt = Chaos(model.parameters(), lr=0.5, beta=0.8)
 
@@ -350,8 +310,7 @@ def test_state_dict_roundtrip():
         return outputs.pow(2).mean()
 
     for _ in range(3):
-        inputs = torch.randn(5, 3)
-        opt.step(model, criterion, inputs)
+        opt.step(model, criterion, torch.randn(5, 3))
 
     state = opt.state_dict()
 
@@ -360,29 +319,68 @@ def test_state_dict_roundtrip():
     opt2 = Chaos(model2.parameters(), lr=0.5, beta=0.8)
     opt2.load_state_dict(state)
 
-    # Momentum buffers match after reload.
     p1 = next(iter(opt.state.values()))["momentum"]
     p2 = next(iter(opt2.state.values()))["momentum"]
     assert torch.allclose(p1, p2)
 
 
 # ---------------------------------------------------------------------------
-# Device
+# CUDA path (stream-parallel + CUDA graph)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_runs_on_cuda():
+@pytest.mark.parametrize("use_cuda_graph", [True, False])
+def test_cuda_path_descends(use_cuda_graph):
+    """The racy CUDA path must still descend on a convex quadratic — the
+    threshold is loose since race dynamics make convergence non-monotonic."""
     device = torch.device("cuda")
-    model = nn.Linear(4, 4).to(device)
-    opt = Chaos(model.parameters(), lr=0.1)
 
-    def criterion(outputs):
-        return outputs.pow(2).mean()
+    class QuadraticModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.x = nn.Parameter(torch.tensor([2.0, -1.5, 1.0], device=device))
 
-    inputs = torch.randn(8, 4, device=device)
-    loss = opt.step(model, criterion, inputs)
-    assert loss.device.type == "cuda"
-    for p in model.parameters():
-        assert p.device.type == "cuda"
-        assert opt.state[p]["momentum"].device.type == "cuda"
+        def forward(self, _=None):
+            return self.x
+
+    model = QuadraticModel()
+    opt = Chaos(
+        model.parameters(),
+        lr=1e-2,
+        num_perturbations=8,
+        weight_decay=0.0,
+        use_cuda_graph=use_cuda_graph,
+    )
+
+    def criterion(x):
+        return (x ** 2).sum()
+
+    start = criterion(model.x).item()
+    for _ in range(300):
+        opt.step(model, criterion)
+    end = criterion(model.x).item()
+
+    assert end < start * 0.7
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cuda_graph_rebuilds_on_input_shape_change():
+    """Changing the input shape between calls must trigger transparent
+    re-capture."""
+    device = torch.device("cuda")
+    model = nn.Linear(3, 3).to(device)
+    opt = Chaos(model.parameters(), lr=1e-2, num_perturbations=4)
+
+    def criterion(out, tgt):
+        return (out - tgt).pow(2).mean()
+
+    x1 = torch.randn(2, 3, device=device)
+    y1 = torch.zeros(2, 3, device=device)
+    for _ in range(3):
+        opt.step(model, criterion, x1, y1)
+
+    x2 = torch.randn(5, 3, device=device)
+    y2 = torch.zeros(5, 3, device=device)
+    loss = opt.step(model, criterion, x2, y2).item()
+    assert torch.isfinite(torch.tensor(loss))

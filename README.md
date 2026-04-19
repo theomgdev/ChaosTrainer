@@ -1,17 +1,31 @@
 # ChaosTrainer
 
 Gradient-free PyTorch optimizer using Evolution-Strategy style stochastic
-perturbations combined with LARS-style global trust-ratio adaptive step sizing.
+perturbations combined with LARS-style global trust-ratio adaptive step
+sizing and decoupled weight decay.
 
-`chaostrainer.Chaos` is a `torch.optim.Optimizer` subclass that works
-transparently on CPU / CUDA / MPS, vectorizes perturbation evaluation via
-`torch.func.vmap`, and supports parameter groups, `state_dict()` checkpointing,
-and per-group hyperparameters.
+`chaostrainer.Chaos` is a `torch.optim.Optimizer` subclass that transparently
+dispatches on parameter device:
+
+- **CUDA** — each perturbation is launched on its own `torch.cuda.Stream`, and
+  the full multi-stream step is captured into a `torch.cuda.CUDAGraph` and
+  replayed each iteration, collapsing thousands of kernel launches into a
+  single replay. Streams mutate the shared parameters in place without
+  synchronization: the race-by-design dynamic behaves like lock-free
+  evolutionary crossover. Trajectories are non-deterministic even with a
+  fixed seed.
+- **CPU / other** — perturbations are evaluated through a single vectorized
+  `torch.func.vmap` over the perturbation axis. Deterministic under a fixed
+  seed.
+
+Both paths share the same public API, hyperparameters, and return value
+(the clean baseline loss `L(θ)` taken before the step's update), support
+parameter groups, per-group hyperparameters, and `state_dict()`
+checkpointing.
 
 Unlike standard PyTorch optimizers, `Chaos.step` takes `(model, criterion,
 *args, **kwargs)` rather than an optional `closure`: the optimizer drives the
-forward pass itself through `torch.func.functional_call`, so `loss.backward()`
-is never needed.
+forward pass itself, so `loss.backward()` is never needed.
 
 ## Why gradient-free?
 
@@ -62,7 +76,7 @@ X = torch.tensor([[0., 0.], [0., 1.], [1., 0.], [1., 1.]])
 Y = torch.tensor([[0.], [1.], [1.], [0.]])
 
 loss_fn = nn.MSELoss()
-optimizer = Chaos(model.parameters(), lr=1e-2)
+optimizer = Chaos(model.parameters(), lr=1e-2, weight_decay=0.0)
 
 for step in range(15_000):
     loss = optimizer.step(model, loss_fn, X, Y).item()
@@ -76,9 +90,9 @@ Each step:
 
 1. Sample `δ_k ~ N(0, ε² I)` independently for every parameter, for
    `k = 1 … num_perturbations`.
-2. Evaluate `L(θ + δ_k)` and `L(θ − δ_k)` in parallel via `vmap` over the
-   perturbation dimension — one vmapped forward pass for the plus batch and
-   one for the minus batch, regardless of `num_perturbations`.
+2. Evaluate `L(θ + δ_k)` and `L(θ − δ_k)` in parallel — on CUDA via one
+   stream per perturbation, on CPU via a single `vmap` over the perturbation
+   axis.
 3. Form the antithetic Evolution-Strategy estimator and average across samples:
 
    ```
@@ -87,15 +101,19 @@ Each step:
 
 4. Update the momentum buffer `m ← β · m + ĝ`.
 5. Take a LARS-inspired step rescaled by the global weight-to-momentum norm
-   ratio
+   ratio and apply decoupled weight decay:
 
    ```
    η = lr · ‖θ‖_global / ‖m‖_global
-   θ ← θ − η · m
+   θ ← (1 − lr · wd) · θ − η · m
    ```
 
    The effective per-step displacement is approximately `lr · ‖θ‖`, so
    `lr ≈ 1e-3` implements the "per-step change ≈ 0.1% of weights" heuristic.
+   Decoupled weight decay counteracts the radial drift of `‖θ‖` that LARS
+   induces under random-direction updates — without it, `‖θ‖` grows
+   unboundedly and scale-sensitive losses (e.g. cross-entropy) stop reflecting
+   accuracy.
 
 ## Hyperparameters
 
@@ -103,12 +121,14 @@ Each step:
 |-----------------------------|---------|-------|
 | `lr`                        | `1e-3`  | Effective per-step displacement as a fraction of `‖θ‖`. |
 | `beta`                      | `0.9`   | Momentum decay on the gradient estimate. |
-| `num_perturbations`         | `1`     | Samples averaged per step. |
-| `perturbation_chunk_size`   | `None`  | Micro-batch size for the vmap forward (caps peak VRAM). `None` ⇒ one chunk of size `num_perturbations`. |
+| `weight_decay`              | `0.01`  | Decoupled shrink `θ ← (1 − lr·wd)·θ`. Set `0.0` on tasks where non-zero weights are essential (e.g. XOR with tiny models). |
+| `num_perturbations`         | `8`     | Samples averaged per step. On CUDA, also the number of concurrent streams. |
+| `perturbation_chunk_size`   | `None`  | CPU path only. Micro-batch size for the vmap forward (caps peak VRAM). `None` ⇒ one chunk. Ignored on CUDA. |
+| `use_cuda_graph`            | `True`  | CUDA path only. Capture the full step into a `CUDAGraph`. Disable when composing with `torch.compile(mode="reduce-overhead")`. |
 
-`lr` and `beta` are per-parameter-group and can be overridden via the standard
-PyTorch `param_groups` mechanism. `num_perturbations` and
-`perturbation_chunk_size` are optimizer-level flags.
+`lr`, `beta`, and `weight_decay` are per-parameter-group and can be overridden
+via the standard PyTorch `param_groups` mechanism. The remaining flags are
+optimizer-level.
 
 The perturbation std `ε = 1e-3` is a fixed internal constant. The variance of
 the central-difference ES estimator is independent of `ε`, and its bias
@@ -122,35 +142,46 @@ mixed-precision (AMP) training without tuning.
 - Lower `beta` (e.g. `0.5`) when rapid adaptation matters; raise it
   (`0.95 – 0.99`) for smoother trajectories in flat regions.
 - Increase `num_perturbations` when the gradient estimate is too noisy and
-  convergence stalls — cost scales linearly.
+  convergence stalls — cost scales linearly on CPU, near-free on CUDA up to
+  the stream-parallelism limit of the device.
+- If reported loss is high but accuracy looks fine, you are probably seeing
+  `‖θ‖` drift. Increase `weight_decay`.
 
-### Performance & VRAM Optimization (Pro Tips)
+### Performance & VRAM optimization
 
-- **Vectorized perturbations via `vmap`:** Each chunk of `num_perturbations`
-  samples is evaluated in two fused forward passes rather than a Python loop,
-  so Python dispatch overhead is amortized across the entire chunk. The plus
-  and minus forward passes are sequenced so their working sets do not overlap
-  in VRAM.
-- **Cap peak VRAM with `perturbation_chunk_size`:** Activation memory scales
-  with the chunk size, not `num_perturbations`. For large `K` (e.g. 1000),
-  setting `perturbation_chunk_size=64` keeps vmap amortization intact while
-  cutting peak activation VRAM by `K/chunk_size`. Use this when OOM risk
-  forces you to choose between batch size and sample count.
-- **Multi-tensor `_foreach` momentum/update:** Parameter-level bookkeeping
-  (momentum step, norm reduction, weight update) uses PyTorch's C++
-  multi-tensor kernels, avoiding per-parameter Python overhead.
-- **`torch.compile()` is your best friend:** Wrapping `model = torch.compile(model)`
-  fuses the vmapped forward into a single kernel, dramatically speeding up
-  large `num_perturbations` runs.
-- **Native Automatic Mixed Precision (AMP):** Since no autograd graph is kept,
+- **CUDA stream + graph path (automatic):** all `num_perturbations` samples run
+  concurrently on dedicated streams; the entire step is captured once into a
+  `torch.cuda.CUDAGraph` and replayed every iteration. Per-stream noise
+  buffers, the gradient accumulator, and the loss scalar are pre-allocated
+  and filled in place — no per-step allocator traffic. Graphs rebuild
+  transparently when input shapes or the parameter set change.
+- **Constant input shapes help graph reuse.** On CUDA, pass a stable batch
+  shape (e.g. `DataLoader(..., drop_last=True)`) to avoid re-capture on the
+  trailing batch.
+- **CPU vmap path (automatic):** plus / minus vmap forwards are sequenced with
+  eager release so only one side's batched parameter tuple is live at a time.
+  Per-parameter gradient reduction uses a matmul over the flattened
+  perturbation axis, avoiding a `[K, *p.shape]` intermediate allocation.
+- **Cap peak VRAM with `perturbation_chunk_size`** on the CPU path when `K` is
+  large — activation memory scales with the chunk size, not `K`.
+- **Multi-tensor `_foreach` momentum/update:** parameter-level bookkeeping
+  uses PyTorch's C++ multi-tensor kernels, avoiding per-parameter Python
+  overhead on both paths.
+- **`torch.compile()` is your friend.** Wrapping the model fuses the forward
+  into a single kernel, dramatically speeding up large `num_perturbations`
+  runs on CPU. On CUDA, keep `use_cuda_graph=True` with plain eager `model`;
+  combine with `torch.compile(mode="reduce-overhead")` only by passing
+  `use_cuda_graph=False` so the two graph managers don't conflict.
+- **Native Automatic Mixed Precision (AMP):** since no autograd graph is kept,
   running forward passes under `torch.autocast` in `fp16` / `bf16` halves the
   memory footprint and unlocks TensorCore acceleration.
 
-## Running the example
+## Running the examples
 
 ```bash
 python examples/xor.py
 python examples/xor.py --device cuda
+python examples/mnist.py --device cuda --compile --num-perturbations 10000
 ```
 
 ## License
@@ -163,3 +194,5 @@ MIT — see [LICENSE](LICENSE).
   Reinforcement Learning.* <https://arxiv.org/abs/1703.03864>
 - You et al. 2017, *Large Batch Training of Convolutional Networks* (LARS).
   <https://arxiv.org/abs/1708.03888>
+- Loshchilov & Hutter 2019, *Decoupled Weight Decay Regularization.*
+  <https://arxiv.org/abs/1711.05101>
