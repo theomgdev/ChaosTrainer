@@ -16,8 +16,6 @@ from torch.optim.optimizer import Optimizer
 __all__ = ["Chaos"]
 
 
-_PERTURBATION_STD: float = 1e-3  # default perturbation scale
-
 # Numerical-stability floor inside the global norms. Only matters on the very
 # first step, before momentum is populated, where ‖m‖ is exactly zero. Outside
 # that cold-start case the value is irrelevant, so there is no knob to tune.
@@ -111,7 +109,7 @@ class Chaos(Optimizer):
         *,
         num_perturbations: int = 1,
         perturbation_chunk_size: int | None = None,
-        perturbation_std: float = _PERTURBATION_STD,
+        perturbation_std: float = 1e-3,
     ) -> None:
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
