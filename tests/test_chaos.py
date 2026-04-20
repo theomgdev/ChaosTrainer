@@ -76,6 +76,20 @@ def test_perturbation_std_stored_and_used():
     assert torch.isfinite(loss)
 
 
+def test_perturbation_std_dynamic_default():
+    model = nn.Linear(4, 2)
+    opt = Chaos(model.parameters(), lr=1e-2)
+    assert opt.perturbation_std is None
+    assert opt.param_groups[0]["perturbation_std"] is None
+
+    def criterion(outputs):
+        return outputs.pow(2).mean()
+
+    # Step should calculate dynamically
+    loss = opt.step(model, criterion, torch.randn(4, 4))
+    assert torch.isfinite(loss)
+
+
 # ---------------------------------------------------------------------------
 # Behavior
 # ---------------------------------------------------------------------------

@@ -5,6 +5,11 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - Unreleased
+
+### Changed
+- `perturbation_std` now defaults to `None`. When `None`, the standard deviation `ε` is dynamically computed per parameter based on its Root Mean Square (RMS) scaling to adapt to fine-tuning layers with vastly different scales. This dynamic calculation avoids GPU-to-CPU synchronization, preserving training performance.
+
 ## [0.4.0] - 2026-04-20
 
 ### Added

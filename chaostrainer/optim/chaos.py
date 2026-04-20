@@ -22,22 +22,20 @@ __all__ = ["Chaos"]
 _NORM_FLOOR: float = 1e-8
 
 
-def _centered_rank_coef(
-    loss_plus: Tensor, loss_minus: Tensor, inv_2eps_sq: float
-) -> Tensor:
+def _centered_rank_coef(loss_plus: Tensor, loss_minus: Tensor) -> Tensor:
     """Antithetic ES coefficients via centered rank transform over all 2K losses.
 
     Ranks all 2K fitness values jointly so the coefficient magnitude is
     invariant to the loss scale and any monotonic transformation of the loss.
     Lower loss → lower centered rank → negative contribution, consistent with
-    the minimization sign convention of the raw ``(L+ − L−) · inv_2eps_sq``
+    the minimization sign convention of the raw ``(L+ − L−)``
     estimator.
     """
     K = loss_plus.shape[0]
     all_losses = torch.cat([loss_plus, loss_minus])                    # [2K]
     raw_ranks = torch.argsort(torch.argsort(all_losses)).float()       # 0 = smallest
     centered = raw_ranks / (2 * K - 1) - 0.5                          # [−0.5, 0.5]
-    return (centered[:K] - centered[K:]) * inv_2eps_sq
+    return centered[:K] - centered[K:]
 
 
 class Chaos(Optimizer):
@@ -77,8 +75,8 @@ class Chaos(Optimizer):
         params: iterable of parameters or dicts defining parameter groups.
         lr: scalar applied on top of the weight-to-momentum norm ratio. The
             effective per-step displacement is approximately ``lr · ‖θ‖``, so
-            values near ``1e-3`` match the "per-step change ≈ 0.1% of weights"
-            heuristic. Default: ``1e-3``.
+            values near ``1e-2`` match the "per-step change ≈ 1% of weights"
+            heuristic. Default: ``1e-2``.
         beta: momentum decay on the gradient estimate. Default: ``0.9``.
         weight_decay: decoupled L2 regularization coefficient. After each ES
             step, parameters are shrunk as ``θ ← θ · (1 − lr · λ)``, in the
@@ -96,11 +94,10 @@ class Chaos(Optimizer):
             enabled, all ``num_perturbations`` noise tensors are held in memory
             simultaneously regardless of this setting. Default: ``None``.
         perturbation_std: standard deviation ``ε`` of the Gaussian perturbation
-            ``δ ~ N(0, ε² I)``. The central-difference estimator's variance is
-            independent of this value and its bias vanishes as ``O(ε²)``, so
-            ``1e-3`` works well for fp32 training. Decrease toward ``1e-4`` for
-            fp16 to stay above the FP noise floor; increase toward ``1e-2`` for
-            very noisy or flat loss surfaces. Must be positive. Default: ``1e-3``.
+            ``δ ~ N(0, ε² I)``. If ``None``, it is dynamically computed per parameter
+            based on its scaling to adapt to fine-tuning. The central-difference
+            estimator's variance is independent of this value and its bias vanishes
+            as ``O(ε²)``. Must be positive if provided. Default: ``None``.
         grad_clip: if set, clips the global L2 norm of the ES gradient estimate
             to this value before the momentum update, preventing runaway steps
             on noisy or sparse objectives. Applied without a GPU→CPU sync.
@@ -156,13 +153,13 @@ class Chaos(Optimizer):
     def __init__(
         self,
         params,
-        lr: float = 1e-3,
+        lr: float = 1e-2,
         beta: float = 0.9,
         weight_decay: float = 0.0,
         *,
         num_perturbations: int = 8,
         perturbation_chunk_size: int | None = None,
-        perturbation_std: float = 1e-3,
+        perturbation_std: float | None = None,
         grad_clip: float | None = None,
         fitness_shaping: bool = True,
         orthogonal_perturbations: bool = True,
@@ -179,7 +176,7 @@ class Chaos(Optimizer):
             raise ValueError(
                 f"Invalid perturbation_chunk_size: {perturbation_chunk_size}"
             )
-        if perturbation_std <= 0.0:
+        if perturbation_std is not None and perturbation_std <= 0.0:
             raise ValueError(f"Invalid perturbation_std: {perturbation_std} (must be > 0)")
         if grad_clip is not None and grad_clip <= 0.0:
             raise ValueError(f"Invalid grad_clip: {grad_clip} (must be > 0)")
@@ -194,7 +191,7 @@ class Chaos(Optimizer):
                 if perturbation_chunk_size is not None
                 else None
             ),
-            perturbation_std=float(perturbation_std),
+            perturbation_std=float(perturbation_std) if perturbation_std is not None else None,
             grad_clip=float(grad_clip) if grad_clip is not None else None,
             fitness_shaping=bool(fitness_shaping),
             orthogonal_perturbations=bool(orthogonal_perturbations),
@@ -206,7 +203,7 @@ class Chaos(Optimizer):
             if perturbation_chunk_size is not None
             else None
         )
-        self.perturbation_std = float(perturbation_std)
+        self.perturbation_std = float(perturbation_std) if perturbation_std is not None else None
         self.grad_clip = float(grad_clip) if grad_clip is not None else None
         self.fitness_shaping = bool(fitness_shaping)
         self.orthogonal_perturbations = bool(orthogonal_perturbations)
@@ -216,7 +213,7 @@ class Chaos(Optimizer):
         optim_params: list[Tensor],
         K: int,
         device: torch.device,
-        eps_std: float,
+        eps_stds: list[Tensor],
     ) -> list[Tensor]:
         """Generate K perturbation noise tensors, one per parameter.
 
@@ -229,7 +226,7 @@ class Chaos(Optimizer):
         """
         if self.orthogonal_perturbations and K > 1:
             noises = []
-            for p in optim_params:
+            for p, eps_std in zip(optim_params, eps_stds):
                 d = p.numel()
                 Z = torch.randn(K, d, device=device, dtype=torch.float32)
                 if K <= d:
@@ -241,7 +238,7 @@ class Chaos(Optimizer):
             return noises
         return [
             torch.randn(K, *p.shape, device=device, dtype=p.dtype) * eps_std
-            for p in optim_params
+            for p, eps_std in zip(optim_params, eps_stds)
         ]
 
     @torch.no_grad()
@@ -299,10 +296,19 @@ class Chaos(Optimizer):
             return empty, empty, [], torch.zeros((), dtype=torch.float32)
 
         device = optim_params[0].device
-        eps_std = self.perturbation_std
-        inv_2eps_sq = 1.0 / (2.0 * eps_std * eps_std)
         K = self.num_perturbations
         M = self.perturbation_chunk_size if self.perturbation_chunk_size is not None else K
+
+        eps_stds: list[Tensor] = []
+        inv_2eps_sqs: list[Tensor] = []
+        for p in optim_params:
+            if self.perturbation_std is None:
+                scale = p.norm() / math.sqrt(p.numel())
+                eps = scale.clamp(min=1e-8) * 1e-2
+            else:
+                eps = torch.tensor(self.perturbation_std, device=device, dtype=p.dtype)
+            eps_stds.append(eps)
+            inv_2eps_sqs.append(1.0 / (2.0 * eps * eps))
 
         def compute_loss(params_tuple):
             params_mapping = dict(zip(optim_names, params_tuple))
@@ -319,7 +325,7 @@ class Chaos(Optimizer):
             # before any coefficient can be computed, and orthogonal perturbations
             # need K jointly-generated directions per parameter.
             # Memory: O(K · |θ|) for noise storage in addition to activations.
-            all_noises = self._generate_noises(optim_params, K, device, eps_std)
+            all_noises = self._generate_noises(optim_params, K, device, eps_stds)
             loss_dtype = optim_params[0].dtype
             all_loss_plus = torch.empty(K, device=device, dtype=loss_dtype)
             all_loss_minus = torch.empty(K, device=device, dtype=loss_dtype)
@@ -337,12 +343,12 @@ class Chaos(Optimizer):
                 offset += k_c
 
             coefs = (
-                _centered_rank_coef(all_loss_plus, all_loss_minus, inv_2eps_sq)
+                _centered_rank_coef(all_loss_plus, all_loss_minus)
                 if self.fitness_shaping
-                else (all_loss_plus - all_loss_minus) * inv_2eps_sq
+                else (all_loss_plus - all_loss_minus)
             )
-            for g, noise in zip(grad_acc, all_noises):
-                g.add_((coefs @ noise.view(K, -1)).view(g.shape))
+            for g, noise, inv_sq in zip(grad_acc, all_noises, inv_2eps_sqs):
+                g.add_(((coefs * inv_sq) @ noise.view(K, -1)).view(g.shape))
             mean_loss = all_loss_plus.sum() / K
 
         else:
@@ -354,7 +360,7 @@ class Chaos(Optimizer):
                 k_c = min(M, K - offset)
                 noises_c: list[Tensor] = [
                     torch.randn(k_c, *p.shape, device=device, dtype=p.dtype) * eps_std
-                    for p in optim_params
+                    for p, eps_std in zip(optim_params, eps_stds)
                 ]
                 plus = tuple(p.unsqueeze(0) + n for p, n in zip(optim_params, noises_c))
                 loss_plus = vmap_loss(plus)
@@ -362,11 +368,11 @@ class Chaos(Optimizer):
                 minus = tuple(p.unsqueeze(0) - n for p, n in zip(optim_params, noises_c))
                 loss_minus = vmap_loss(minus)
                 del minus
-                coef = (loss_plus - loss_minus) * inv_2eps_sq
+                coef = (loss_plus - loss_minus)
                 loss_plus_sum = loss_plus_sum + loss_plus.sum()
                 del loss_minus
-                for g, noise in zip(grad_acc, noises_c):
-                    g.add_((coef @ noise.view(k_c, -1)).view(g.shape))
+                for g, noise, inv_sq in zip(grad_acc, noises_c, inv_2eps_sqs):
+                    g.add_(((coef * inv_sq) @ noise.view(k_c, -1)).view(g.shape))
                 del noises_c, coef, loss_plus
                 offset += k_c
             mean_loss = loss_plus_sum / K
@@ -397,7 +403,7 @@ class Chaos(Optimizer):
         .. code-block:: python
 
             chaos = Chaos(model.parameters(), num_perturbations=16)
-            adamw = torch.optim.AdamW(model.parameters(), lr=1e-3)
+            adamw = torch.optim.AdamW(model.parameters(), lr=1e-2)
 
             for data, target in dataloader:
                 adamw.zero_grad()
@@ -409,7 +415,7 @@ class Chaos(Optimizer):
         .. code-block:: python
 
             chaos = Chaos(model.parameters())
-            adamw = torch.optim.AdamW(model.parameters(), lr=1e-3)
+            adamw = torch.optim.AdamW(model.parameters(), lr=1e-2)
 
             for state in env:
                 adamw.zero_grad()

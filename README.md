@@ -83,7 +83,7 @@ estimate into `param.grad` instead of applying the update — exactly like
 
 ```python
 chaos = Chaos(model.parameters(), num_perturbations=16)
-adamw = torch.optim.AdamW(model.parameters(), lr=1e-3)
+adamw = torch.optim.AdamW(model.parameters(), lr=1e-2)
 
 for data, target in dataloader:
     adamw.zero_grad()
@@ -97,7 +97,7 @@ No `backward()` needed at all — the reward signal never touches autograd:
 
 ```python
 chaos = Chaos(model.parameters())
-adamw = torch.optim.AdamW(model.parameters(), lr=1e-3)
+adamw = torch.optim.AdamW(model.parameters(), lr=1e-2)
 
 for state in env:
     adamw.zero_grad()
@@ -156,18 +156,18 @@ Each step:
    ```
 
    The effective per-step displacement is approximately `lr · ‖θ‖`, so
-   `lr ≈ 1e-3` implements the "per-step change ≈ 0.1% of weights" heuristic.
+   `lr ≈ 1e-2` implements the "per-step change ≈ 1% of weights" heuristic.
 
 ## Hyperparameters
 
 | Name                          | Default | Notes |
 |-------------------------------|---------|-------|
-| `lr`                          | `1e-3`  | Effective per-step displacement as a fraction of `‖θ‖`. |
+| `lr`                          | `1e-2`  | Effective per-step displacement as a fraction of `‖θ‖`. |
 | `beta`                        | `0.9`   | Momentum decay on the gradient estimate. |
 | `weight_decay`                | `0.0`   | Decoupled L2 regularization coefficient (AdamW-style). Applied per-group as `θ ← θ · (1 − lr · λ)` after the ES step. |
 | `num_perturbations`           | `8`     | Samples averaged per step. More samples reduce variance linearly at proportional forward-pass cost. |
 | `perturbation_chunk_size`     | `None`  | Micro-batch size for the vmap forward (caps peak activation VRAM). `None` ⇒ one chunk of size `num_perturbations`. |
-| `perturbation_std`            | `1e-3`  | Standard deviation `ε` of `δ ~ N(0, ε² I)`. The estimator variance is independent of `ε`; bias vanishes as `O(ε²)`. |
+| `perturbation_std`            | `None`  | Standard deviation `ε` of `δ ~ N(0, ε² I)`. If `None`, computed dynamically per parameter via RMS. The estimator variance is independent of `ε`; bias vanishes as `O(ε²)`. |
 | `grad_clip`                   | `None`  | Global L2 gradient norm clip threshold, applied before the momentum update. No GPU→CPU sync. |
 | `fitness_shaping`             | `True`  | Replace raw loss differences with centered rank scores over all `2K` evaluations. Makes the update invariant to monotonic loss transformations. |
 | `orthogonal_perturbations`    | `True`  | Orthogonalize the `K` noise directions per parameter via QR (in float32). Reduces estimator variance at the same sample count. Falls back to i.i.d. when `K > param.numel()`. |
@@ -194,8 +194,8 @@ and `orthogonal_perturbations` are optimizer-level flags.
 - Lower `num_perturbations` (e.g. `2–4`) only when compute is very tight.
   Raise it (e.g. `16–64`) on high-variance or high-dimensional objectives
   where the default 8 samples leave the estimate noisy.
-- Adjust `perturbation_std` only when the default `1e-3` fails: lower toward
-  `1e-4` for fp16 training (to stay above the FP noise floor); raise toward
+- Adjust `perturbation_std` only when the dynamic parameter scaling fails: explicitly set to
+  `1e-4` for fp16 training (to stay above the FP noise floor), or raise toward
   `1e-2` for very noisy or flat loss surfaces.
 - Use `weight_decay` (e.g. `1e-4`) as a regularizer for large models; it
   costs nothing extra and applies per-group.
