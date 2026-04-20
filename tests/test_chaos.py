@@ -76,6 +76,20 @@ def test_perturbation_std_stored_and_used():
     assert torch.isfinite(loss)
 
 
+def test_perturbation_std_dynamic_default():
+    model = nn.Linear(4, 2)
+    opt = Chaos(model.parameters(), lr=1e-2)
+    assert opt.perturbation_std is None
+    assert opt.param_groups[0]["perturbation_std"] is None
+
+    def criterion(outputs):
+        return outputs.pow(2).mean()
+
+    # Step should calculate dynamically
+    loss = opt.step(model, criterion, torch.randn(4, 4))
+    assert torch.isfinite(loss)
+
+
 # ---------------------------------------------------------------------------
 # Behavior
 # ---------------------------------------------------------------------------
@@ -571,3 +585,128 @@ def test_fitness_shaping_and_orthogonal_combined():
         opt.step(model, criterion)
     end = criterion(model.x).item()
     assert end < start * 0.5
+
+
+# ---------------------------------------------------------------------------
+# estimate_grad
+# ---------------------------------------------------------------------------
+
+
+def test_estimate_grad_populates_grad():
+    """estimate_grad must write a finite gradient into param.grad."""
+    torch.manual_seed(0)
+    model = nn.Linear(4, 2)
+    chaos = Chaos(model.parameters(), num_perturbations=4)
+
+    assert all(p.grad is None for p in model.parameters())
+    loss = chaos.estimate_grad(model, lambda out: out.pow(2).mean(), torch.randn(4, 4))
+
+    assert torch.isfinite(loss)
+    for p in model.parameters():
+        assert p.grad is not None
+        assert torch.isfinite(p.grad).all()
+        assert p.grad.shape == p.shape
+
+
+def test_estimate_grad_accumulates_into_existing_grad():
+    """Calling estimate_grad twice must accumulate (add) rather than overwrite,
+    matching the behaviour of loss.backward()."""
+    torch.manual_seed(0)
+    model = nn.Linear(2, 2)
+    chaos = Chaos(model.parameters(), num_perturbations=4)
+
+    def criterion(out):
+        return out.pow(2).mean()
+
+    x = torch.randn(4, 2)
+    chaos.estimate_grad(model, criterion, x)
+    grad_after_one = [p.grad.clone() for p in model.parameters()]
+
+    chaos.estimate_grad(model, criterion, x)
+    for p, g1 in zip(model.parameters(), grad_after_one):
+        # Second call added to the first — magnitude should have grown.
+        assert not torch.allclose(p.grad, g1)
+
+
+def test_estimate_grad_frozen_params_get_no_grad():
+    """Frozen parameters (requires_grad=False) must not receive a .grad."""
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.trainable = nn.Parameter(torch.ones(4))
+            self.frozen = nn.Parameter(torch.ones(4), requires_grad=False)
+
+        def forward(self, x=None):
+            return self.trainable + self.frozen
+
+    model = DummyModel()
+    chaos = Chaos(model.parameters(), num_perturbations=4)
+    chaos.estimate_grad(model, lambda out: out.pow(2).mean())
+
+    assert model.trainable.grad is not None
+    assert model.frozen.grad is None
+
+
+def test_estimate_grad_returns_scalar_loss():
+    """Return value must be a detached scalar tensor."""
+    torch.manual_seed(0)
+    model = nn.Linear(3, 1)
+    chaos = Chaos(model.parameters(), num_perturbations=4)
+    loss = chaos.estimate_grad(model, lambda out: out.pow(2).mean(), torch.randn(5, 3))
+
+    assert loss.ndim == 0
+    assert loss.requires_grad is False
+
+
+def test_estimate_grad_with_adamw_converges_on_quadratic():
+    """ES gradient estimate fed into AdamW must descend a simple quadratic."""
+    torch.manual_seed(0)
+
+    class QuadraticModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.x = nn.Parameter(torch.tensor([3.0, -2.0, 1.5]))
+
+        def forward(self, _=None):
+            return self.x
+
+    model = QuadraticModel()
+    chaos = Chaos(model.parameters(), num_perturbations=4)
+    adamw = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=0.0)
+
+    def criterion(x):
+        return (x ** 2).sum()
+
+    start = criterion(model.x).item()
+    for _ in range(500):
+        adamw.zero_grad()
+        chaos.estimate_grad(model, criterion)
+        adamw.step()
+
+    end = criterion(model.x).item()
+    assert end < start * 0.5
+
+
+def test_estimate_grad_with_adamw_converges_xor():
+    """Full XOR integration: estimate_grad + AdamW must reach low loss."""
+    torch.manual_seed(0)
+    model = nn.Sequential(
+        nn.Linear(2, 4), nn.Tanh(), nn.Linear(4, 1), nn.Sigmoid()
+    )
+    X = torch.tensor([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]])
+    Y = torch.tensor([[0.0], [1.0], [1.0], [0.0]])
+    loss_fn = nn.MSELoss()
+
+    chaos = Chaos(model.parameters(), num_perturbations=8)
+    adamw = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=0.0)
+
+    final_loss = None
+    for _ in range(3000):
+        adamw.zero_grad()
+        final_loss = chaos.estimate_grad(model, loss_fn, X, Y).item()
+        adamw.step()
+        if final_loss < 1e-2:
+            break
+
+    assert final_loss is not None
+    assert final_loss < 0.1, f"XOR+AdamW did not converge: {final_loss}"

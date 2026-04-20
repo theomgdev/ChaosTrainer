@@ -5,6 +5,48 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - Unreleased
+
+### Changed
+- `perturbation_std` now defaults to `None`. When `None`, the standard deviation `ε` is dynamically computed per parameter based on its Root Mean Square (RMS) scaling to adapt to fine-tuning layers with vastly different scales. This dynamic calculation avoids GPU-to-CPU synchronization, preserving training performance.
+
+## [0.4.0] - 2026-04-20
+
+### Added
+- `estimate_grad(model, criterion, *args, **kwargs)` public method on `Chaos`.
+  Runs the identical ES forward passes as `step()` but writes the resulting
+  per-parameter gradient estimate into `param.grad` (accumulating, like
+  `loss.backward()`) instead of applying the LARS momentum update. Enables
+  three new usage patterns without any changes to existing code:
+  - **Pair with any standard optimizer** — `chaos.estimate_grad(...)` then
+    `adamw.step()`: AdamW (or any optimizer) owns the update rule while Chaos
+    supplies gradient-free gradient estimates.
+  - **Gradient-free RL / black-box objectives** — reward signal goes through
+    `estimate_grad`; no `backward()` call needed at any point.
+  - **ES + backprop hybrid** — call `estimate_grad` then `loss.backward()` to
+    accumulate both signal sources into `param.grad` before a single
+    `optimizer.step()`.
+- `_run_es(model, criterion, *args, **kwargs)` private method that encapsulates
+  the entire ES forward-pass loop, returning `(optim_params, grad_acc,
+  group_slices, mean_loss)`. Both `step()` and `estimate_grad()` delegate to
+  `_run_es`, eliminating all duplicate ES logic.
+- `examples/xor_adamw.py` — new example demonstrating `estimate_grad` paired
+  with `torch.optim.AdamW`.
+
+### Changed
+- `step()` refactored to call `_run_es()` internally; behaviour is identical
+  to prior releases.
+- README expanded with four usage sections: standalone ES, `estimate_grad` +
+  external optimizer, gradient-free RL, and ES+backprop hybrid.
+
+### Notes
+- **Why not replace LARS with AdamW by default?** Benchmarks (8 seeds, XOR)
+  show LARS converges in ~294 steps on average vs ~530 for ES+AdamW at the
+  same `num_perturbations=8`. AdamW's second moment accumulates the ES
+  estimator variance and shrinks steps disproportionately; LARS's norm ratio
+  is noise-invariant by design. `estimate_grad` lets users opt in to AdamW (or
+  any other rule) when they prefer its properties.
+
 ## [0.3.1] - 2026-04-20
 
 ### Fixed
